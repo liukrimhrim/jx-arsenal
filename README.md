@@ -11,11 +11,12 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 |---|---|
 | [`gh_levers/`](gh_levers/) | `pr`: review threads, reply/comment with verify, commits since last review, check rollup. `ci`: Actions runs, jobs by attempt, failed-job log triage, dispatch, wait. |
 | [`k_levers/`](k_levers/) | `k <env>`: pods with waiting reasons, deployment images + GIT_SHA, Karpenter node/nodeclaim census, warning events, grepped logs, rollout, secret keys; `k all` across environments. |
+| [`aws_levers/`](aws_levers/) | `awsx`: SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS cluster/addons/nodegroups. All timestamps UTC. |
 
 ## Install as Claude Code skills
 
 ```bash
-for d in gh_levers k_levers; do ln -sfn "$PWD/$d" ~/.claude/skills/$d; done
+for d in gh_levers k_levers aws_levers; do ln -sfn "$PWD/$d" ~/.claude/skills/$d; done
 ```
 
 Each lever directory carries a `SKILL.md` so the agent discovers it.
