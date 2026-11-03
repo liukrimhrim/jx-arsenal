@@ -24,8 +24,9 @@ description cannot slip past a long existing one that says the same thing. `--fo
 file follows the memory contract (frontmatter with name, description, metadata.type) and gets its
 `- [Title](file.md) — hook` line in `MEMORY.md`.
 
-`doctor --fix-index` appends an index line for every orphan. The index is loaded into every session's
-prefill, so on a large memory directory prefer curating which orphans deserve a line.
+`doctor` counts a memory as reachable when `MEMORY.md` links it directly or links a hub file (any indexed
+file that itself links three or more memories) that links it. Hubs are how a large memory stays within the
+prefill budget, so `--fix-index` should be rare; prefer adding a line to the right hub.
 
 ## Transcripts
 
@@ -46,5 +47,5 @@ Thinking parts are never printed.
 
 The mining that produced this arsenal was itself 343 transcript heredocs; `tx cmds` is that extractor
 as a command. `mem add`'s duplicate check encodes the standing rule to look for an existing memory
-before writing one. `mem doctor` found, on first run, that 128 of 330 memory files in the main project
-had no index line and were therefore invisible to recall.
+before writing one. `mem doctor`'s first run reported 128 of 330 memory files as orphans; following hub files showed 126 of
+them reachable and only 2 truly unindexed. The tool was wrong before the index was.

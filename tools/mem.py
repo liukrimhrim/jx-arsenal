@@ -4,7 +4,7 @@
   jx mem ls [--type T] [--grep REGEX]          every memory: name, type, modified, description (from frontmatter)
   jx mem show <name>                           print one memory file (name or file stem)
   jx mem grep <REGEX>                          search bodies: name, line number, line
-  jx mem doctor [--fix-index]                  files without an index line, index lines without a file, bad frontmatter; --fix-index appends the missing index lines
+  jx mem doctor [--fix-index]                  files reachable from neither MEMORY.md nor a hub it links, dangling index lines, bad frontmatter; --fix-index appends index lines
   jx mem add <slug> --type T --desc "..." --body-file F|- [--link NAME ...] [--force]   new memory file + index line; refuses existing slugs and near-duplicates
   jx mem append <name> --body-file F|-         append a dated addendum to one memory
   jx mem edit <name> [--replace OLD NEW] [--desc "..."]   exact single-occurrence replace; --desc rewrites the description and its index hook
@@ -73,17 +73,22 @@ def cmd_grep(a):
 
 def cmd_doctor(a):
     d = mem_dir(a); mems = load(d); idx = open(os.path.join(d, "MEMORY.md")).read() if os.path.exists(os.path.join(d, "MEMORY.md")) else ""
-    linked = set(re.findall(r"\]\(([^)]+\.md)\)", idx)); files = {m["file"] for m in mems}
+    links = lambda text: set(re.findall(r"\]\(([^)]+\.md)\)", text))
+    direct = links(idx); files = {m["file"] for m in mems}
+    # a file the index links that itself links three or more memories is a hub (sub-index); what it links counts as indexed
+    hubs = sorted(f for f in direct & files if len(links(open(os.path.join(d, f)).read())) >= 3)
+    via_hub = {t for f in hubs for t in links(open(os.path.join(d, f)).read())} - direct
+    linked = direct | via_hub
     if a.fix_index:
         missing = [m for m in mems if m["file"] not in linked]
         append_index(d, [index_line(m["file"], m["name"], m["description"]) for m in missing]); linked |= {m["file"] for m in missing}
         idx = open(os.path.join(d, "MEMORY.md")).read(); sys.stderr.write(f"added {len(missing)} index lines\n")
-    rows = [{"issue": "no index line", "file": f} for f in sorted(files - linked)]
+    rows = [{"issue": "unreachable: not in MEMORY.md nor in a hub it links", "file": f} for f in sorted(files - linked)]
     rows += [{"issue": "index points at missing file", "file": f} for f in sorted(linked - files)]
     rows += [{"issue": "no frontmatter", "file": m["file"]} for m in mems if not m["fm_ok"]]
     rows += [{"issue": "frontmatter name differs from file stem (fine, but search by either)", "file": m["file"]} for m in mems if m["name"].replace("-", "_") != m["file"][:-3].replace("-", "_")]
     emit(rows, ["issue", "file"], a)
-    sys.stderr.write(f"{len(mems)} memories, {len(linked)} indexed, {len(idx.splitlines())} index lines; {len(rows)} issues\n")
+    sys.stderr.write(f"{len(mems)} memories: {len(direct & files)} linked from MEMORY.md, {len(via_hub & files)} via {len(hubs)} hubs ({', '.join(hubs)}); {len(idx.splitlines())} index lines; {len(rows)} issues\n")
 
 STOP = {"that", "this", "with", "from", "when", "what", "then", "than", "have", "into", "over", "only", "your", "them", "they", "also", "been", "does", "must", "never",
         "always", "before", "after", "should", "about", "which", "their", "there", "where", "while", "will", "would", "could", "more", "some", "such", "each", "very", "just", "like", "memory"}
