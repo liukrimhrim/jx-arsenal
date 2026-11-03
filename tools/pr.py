@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""pr — PR lifecycle lever for agents. TSV by default, --json for the raw payload.
+"""jx pr — PR lifecycle lever for agents. TSV by default, --json for the raw payload.
 
-  pr threads <n> [--all] [--full]                  review threads (unresolved only unless --all)
-  pr reply <n> <comment-id> --body-file F | --body S [--dry-run]
-                                                   reply to a review comment, then re-read it to verify
-  pr comment <n> --body-file F | --body S [--dry-run]
-                                                   top-level PR comment, then re-read it to verify
-  pr since <n> [--since ISO]                       commits + file diffstat pushed after the last review by someone else
-  pr ci <n> [--wait] [--failed] [--interval S]     check rollup; --wait polls until nothing is pending;
-                                                   --failed prints job ids of failed checks (feed to `ci logs`)
-  pr doctor
+  jx pr threads <n> [--all] [--full]                  review threads (unresolved only unless --all)
+  jx pr reply <n> <comment-id> --body-file F [--dry-run]   reply to a review comment, then re-read it to verify
+  jx pr comment <n> --body-file F [--dry-run]         top-level PR comment, then re-read it to verify
+  jx pr commits <n> [--since ISO]                     commits + file diffstat pushed after the last review by someone else
+  jx pr triage <n> [--wait]                           check rollup, then `jx ci failed` for every failing run: one call, no glue
+  jx pr ci <n> [--wait] [--failed]                    check rollup; --wait polls until settled; --failed emits run_id/job_id TSV for `jx ci failed -`
+  jx pr doctor
 
 Exit codes: 0 ok · 1 something failed (a failing check, a verify mismatch) · 2 usage/auth.
 Posting (reply/comment) is an outward action: run with --dry-run first, post only with approval.
@@ -20,11 +18,12 @@ from datetime import datetime, timezone
 
 CMD = ""  # current subcommand, for error hints
 NOT_FOUND = {
+    "triage": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
     "threads": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
-    "since": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
+    "commits": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
     "ci": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
     "comment": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
-    "reply": "PR or comment id not found. `pr threads <n>` prints the root comment_id of each thread; reply to that id, not the thread id.",
+    "reply": "PR or comment id not found. `jx pr threads <n>` prints the root comment_id of each thread; reply to that id, not the thread id.",
 }
 
 def sh(args, stdin=None):
@@ -152,6 +151,25 @@ def cmd_ci(args):
     sys.stderr.write(f"{len(failed)} failed, {sum(c['bucket']=='pass' for c in rows)} passed, {sum(c['bucket']=='pending' for c in rows)} pending\n")
     sys.exit(1 if failed else 0)
 
+def cmd_triage(args):
+    """pr ci --failed, then ci failed per run, in-process: the failing log lines arrive in one call."""
+    import os
+    deadline = time.time() + args.timeout
+    while True:
+        rows = checks(args); pending = [c for c in rows if c["bucket"] == "pending"]
+        if not (args.wait and pending) or time.time() > deadline: break
+        sys.stderr.write(f"{len(pending)} pending… sleep {args.interval}s\n"); time.sleep(args.interval)
+    failed = [c for c in rows if c["bucket"] == "fail"]
+    print(f"{len(failed)} failed, {sum(c['bucket']=='pass' for c in rows)} passed, {len(pending)} pending")
+    if not failed: return
+    for c in failed: print(f"FAIL\t{c['name']}\t{c['link']}")
+    runs = list(dict.fromkeys(m.group(1) for c in failed for m in [re.search(r"/actions/runs/(\d+)", c["link"] or "")] if m))
+    ci = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci.py")
+    for r in runs:
+        print(); sys.stdout.flush()
+        subprocess.run([sys.executable, ci, "failed", r, "--max-lines", str(args.max_lines)] + (["-R", args.repo] if args.repo else []))
+    sys.exit(1)
+
 def cmd_doctor(args):
     print(gh("auth", "status").strip().splitlines()[1].strip()); print("repo:", repo_of(args)); print("ok")
 
@@ -162,20 +180,23 @@ def add_globals(p, suppress=False):
 
 def main():
     global CMD
-    ap = argparse.ArgumentParser(prog="pr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
+    ap = argparse.ArgumentParser(prog="jx pr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
     g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
     sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
     p = sp.add_parser("threads", parents=[g], help="review threads with comment ids; unresolved only unless --all")
     p.add_argument("n", type=int, help="PR number"); p.add_argument("--all", action="store_true", help="include resolved threads"); p.add_argument("--full", action="store_true", help="full comment bodies instead of the first 200 chars"); p.set_defaults(f=cmd_threads)
     for name, f, h in (("reply", cmd_reply, "reply to a review comment, then re-read it to verify"), ("comment", cmd_comment, "post a top-level PR comment, then re-read it to verify")):
         p = sp.add_parser(name, parents=[g], help=h); p.add_argument("n", type=int, help="PR number")
-        if name == "reply": p.add_argument("comment_id", type=int, help="root comment_id from `pr threads`")
+        if name == "reply": p.add_argument("comment_id", type=int, help="root comment_id from `jx pr threads`")
         p.add_argument("--body-file", help="file holding the markdown body"); p.add_argument("--body", help="inline body"); p.add_argument("--dry-run", action="store_true", help="print endpoint and body, post nothing"); p.set_defaults(f=f)
-    p = sp.add_parser("since", parents=[g], help="commits and per-file diffstat pushed after the last review by someone else")
+    p = sp.add_parser("commits", parents=[g], help="commits and per-file diffstat pushed after the last review by someone else")
     p.add_argument("n", type=int, help="PR number"); p.add_argument("--since", help="ISO timestamp; default is the last review submitted by someone other than you"); p.set_defaults(f=cmd_since)
     p = sp.add_parser("ci", parents=[g], help="check rollup sorted fail > pending > pass; exit 1 if anything failed")
-    p.add_argument("n", type=int, help="PR number"); p.add_argument("--wait", action="store_true", help="poll until nothing is pending"); p.add_argument("--failed", action="store_true", help="print job_id/run_id of failed checks for `ci failed` / `ci logs`")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--wait", action="store_true", help="poll until nothing is pending"); p.add_argument("--failed", action="store_true", help="print job_id/run_id of failed checks for `jx ci failed` / `jx ci logs`")
     p.add_argument("--interval", type=int, default=30, help="seconds between polls (30)"); p.add_argument("--timeout", type=int, default=2400, help="give up after this many seconds (2400)"); p.set_defaults(f=cmd_ci)
+    p = sp.add_parser("triage", parents=[g], help="check rollup plus `jx ci failed` for every failing run, in one call")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--wait", action="store_true", help="poll until nothing is pending first"); p.add_argument("--interval", type=int, default=30, help="seconds between polls (30)")
+    p.add_argument("--timeout", type=int, default=2400, help="give up waiting after this many seconds (2400)"); p.add_argument("--max-lines", type=int, default=60, help="log lines per failed job (60)"); p.set_defaults(f=cmd_triage)
     sp.add_parser("doctor", parents=[g], help="auth status and resolved repo").set_defaults(f=cmd_doctor)
     args = ap.parse_args(); CMD = args.cmd; args.f(args)
 

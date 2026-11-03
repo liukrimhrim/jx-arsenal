@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""k — kubectl lever for agents, one environment per call. TSV by default, --json for raw kubectl JSON.
+"""jx k — kubectl lever for agents, one environment per call. TSV by default, --json for raw kubectl JSON.
 
-  k <env> pods [-n NS | -A] [-l SELECTOR]        name, ready, status/waiting reason, restarts, age, node (unhealthy first)
-  k <env> img [DEPLOY] [-n NS] [--env-var NAME]  image per container of each deployment, plus one env var (default GIT_SHA)
-  k <env> nodes [--pools]                        nodes with instance type, zone, pool, capacity type, age; --pools = nodeclaims by pool
-  k <env> events [-n NS | -A] [--warn]           events newest first; --warn = Warning only
-  k <env> logs <deploy/NAME | pod/NAME> [-n NS] [--since 10m] [--grep PAT] [-C N] [--tail N]
-  k <env> rollout <deploy/NAME> [-n NS] [--timeout 300s]
-  k <env> secret <NAME> <KEY> [-n NS]            one key, base64-decoded, to stdout
-  k <env> doctor
-  k all <subcommand ...>                         run against every env in $K_ENVS (comma list) or the map file
+  jx k <env> pods [-n NS | -A] [-l SELECTOR]        name, ready, status/waiting reason, restarts, age, node (unhealthy first)
+  jx k <env> images [DEPLOY] [-n NS] [--env-var NAME]  image per container of each deployment, plus one env var (default GIT_SHA)
+  jx k <env> nodes [--pools]                        nodes with instance type, zone, pool, capacity type, age; --pools = nodeclaims by pool
+  jx k <env> events [-n NS | -A] [--warn]           events newest first; --warn = Warning only
+  jx k <env> logs <deploy/NAME | pod/NAME> [-n NS] [--since 10m] [--grep PAT] [-C N] [--tail N]
+  jx k <env> rollout <deploy/NAME> [-n NS] [--timeout 300s]
+  jx k <env> secret <NAME> <KEY> [-n NS]            one key, base64-decoded, to stdout
+  jx k <env> doctor
+  jx k all <subcommand ...>                         run against every env in $K_ENVS (comma list) or the map file
 
 <env> is the kubectl context name unless ~/.config/jx-arsenal/k.json maps it:
   {"envs": {"prod": {"context": "arn:aws:eks:...:cluster/x"}, "stage": {"context": "stage-cluster"}}}
-The file also defines the env list `k all` uses. Nothing cluster-specific lives in this script.
+The file also defines the env list `jx k all` uses. Nothing cluster-specific lives in this script.
 """
 import argparse, base64, contextlib, io, json, os, re, subprocess, sys, signal
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
@@ -31,32 +31,32 @@ def context_of(env):
 def all_envs():
     if os.environ.get("K_ENVS"): return os.environ["K_ENVS"].split(",")
     envs = list(cfg()["envs"])
-    if not envs: sys.exit(f"`k all` needs K_ENVS=a,b,c or an envs map in {CFG}")
+    if not envs: sys.exit(f"`jx k all` needs K_ENVS=a,b,c or an envs map in {CFG}")
     return envs
 
 CMD = ""  # current subcommand, for error hints
 NOT_FOUND = {
-    "img": "deployment not found in that namespace. `k <env> img -n <ns>` lists every deployment; `k <env> pods -A | cut -f1 | sort -u` lists namespaces.",
-    "logs": "target not found. Use kind/name (deploy/x, pod/x, sts/x) and the right -n; `k <env> pods -n <ns>` lists pods, `k <env> img -n <ns>` lists deployments.",
-    "rollout": "deployment not found. `k <env> img -n <ns>` lists deployments in that namespace.",
+    "images": "deployment not found in that namespace. `jx k <env> images -n <ns>` lists every deployment; `jx k <env> pods -A | cut -f1 | sort -u` lists namespaces.",
+    "logs": "target not found. Use kind/name (deploy/x, pod/x, sts/x) and the right -n; `jx k <env> pods -n <ns>` lists pods, `jx k <env> images -n <ns>` lists deployments.",
+    "rollout": "deployment not found. `jx k <env> images -n <ns>` lists deployments in that namespace.",
     "secret": "secret not found in that namespace. `kubectl --context <ctx> -n <ns> get secrets` lists names; check -n.",
 }
 
 def check_ns(env, ns):
     """A query scoped to a namespace that does not exist returns an empty list, not an error. Make it an error."""
     if ns and subprocess.run(["kubectl", "--context", context_of(env), "--request-timeout", "20s", "get", "ns", ns], capture_output=True).returncode:
-        sys.exit(f"namespace {ns!r} does not exist in {env}. `k {env} pods -A | cut -f1 | sort -u` lists namespaces.")
+        sys.exit(f"namespace {ns!r} does not exist in {env}. `jx k {env} pods -A | cut -f1 | sort -u` lists namespaces.")
 
 def kubectl(args, env, ns=None, all_ns=False, ok=(0,)):
     # namespace flags go AFTER the verb: kubectl treats a leading -A as a plugin name
     cmd = ["kubectl", "--context", context_of(env), "--request-timeout", "20s"] + args + (["-A"] if all_ns else ["-n", ns] if ns else [])
     try: p = subprocess.run(cmd, text=True, capture_output=True, timeout=int(os.environ.get("K_TIMEOUT", "45")))
     except subprocess.TimeoutExpired:  # kubectl's discovery retries ignore --request-timeout; bound the whole call
-        sys.exit(f"{env}: no answer in {os.environ.get('K_TIMEOUT', '45')}s (VPN/tailnet down? wrong context?)  → run `k {env} doctor`")
+        sys.exit(f"{env}: no answer in {os.environ.get('K_TIMEOUT', '45')}s (VPN/tailnet down? wrong context?)  → run `jx k {env} doctor`")
     if p.returncode not in ok:
         err = p.stderr.strip()
-        if re.search(r"context|credential|Unauthorized|token|exec plugin|forbidden", err, re.I): hint = f"→ run `k {env} doctor`; a cluster behind a VPN/tailnet needs it up first"
-        elif re.search(r"NotFound|not found", err): hint = "→ " + NOT_FOUND.get(CMD, f"`k {env} pods -A` shows what exists")
+        if re.search(r"context|credential|Unauthorized|token|exec plugin|forbidden", err, re.I): hint = f"→ run `jx k {env} doctor`; a cluster behind a VPN/tailnet needs it up first"
+        elif re.search(r"NotFound|not found", err): hint = "→ " + NOT_FOUND.get(CMD, f"`jx k {env} pods -A` shows what exists")
         else: hint = ""
         sys.exit(f"{err}\n{hint}" if hint else err)
     return p.stdout
@@ -186,7 +186,7 @@ def cmd_doctor(args):
 
 def main(argv=None):
     global CMD
-    ap = argparse.ArgumentParser(prog="k", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="jx k", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("env", help="environment: a kubectl context name, a key in the map file, or `all`")
     ap.add_argument("--json", action="store_true", help="raw kubectl JSON instead of TSV")
     g = argparse.ArgumentParser(add_help=False); g.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="raw kubectl JSON instead of TSV")  # accepted after the subcommand too
@@ -195,7 +195,7 @@ def main(argv=None):
         p.add_argument("-n", metavar="NS", help="namespace; default is the context's namespace")
         if all_ns: p.add_argument("-A", action="store_true", help="all namespaces")
     p = sp.add_parser("pods", parents=[g], help="pods, unhealthy first, with waiting reason, restarts, age, node"); ns(p); p.add_argument("-l", metavar="SELECTOR", help="label selector, e.g. app=api"); p.set_defaults(f=cmd_pods)
-    p = sp.add_parser("img", parents=[g], help="image per container of each deployment, plus one env var"); p.add_argument("deploy", nargs="?", help="one deployment; default is every deployment in the namespace"); ns(p, False)
+    p = sp.add_parser("images", parents=[g], help="image per container of each deployment, plus one env var"); p.add_argument("deploy", nargs="?", help="one deployment; default is every deployment in the namespace"); ns(p, False)
     p.add_argument("--env-var", default="GIT_SHA", help="container env var to show next to the image (GIT_SHA)"); p.add_argument("--full", action="store_true", help="full image refs with registry and digest"); p.set_defaults(f=cmd_img)
     p = sp.add_parser("nodes", parents=[g], help="nodes with instance type, zone, pool, capacity type, kubelet version, age"); p.add_argument("--pools", action="store_true", help="Karpenter nodeclaims grouped by nodepool instead of nodes"); p.set_defaults(f=cmd_nodes)
     p = sp.add_parser("events", parents=[g], help="events newest first"); ns(p); p.add_argument("--warn", action="store_true", help="Warning events only"); p.add_argument("--limit", type=int, default=50, help="max events (50)"); p.set_defaults(f=cmd_events)
@@ -206,7 +206,7 @@ def main(argv=None):
     sp.add_parser("doctor", parents=[g], help="context exists, server reachable, version, can-i get pods").set_defaults(f=cmd_doctor)
     args = ap.parse_args(argv); CMD = args.cmd
     if args.env != "all": args.f(args); return
-    if args.cmd in ("secret", "logs", "rollout"): sys.exit(f"`k all {args.cmd}` not supported; one env at a time")
+    if args.cmd in ("secret", "logs", "rollout"): sys.exit(f"`jx k all {args.cmd}` not supported; one env at a time")
     first = True
     for env in all_envs():
         args.env = env; buf = io.StringIO()

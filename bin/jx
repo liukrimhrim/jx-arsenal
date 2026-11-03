@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""jx — one entry point for the arsenal.
+
+  jx ls                 every command, one line each (read this once per session)
+  jx <tool> --help      one tool in depth; tools: pr, ci, k, aws
+  jx doctor             gh auth, aws identity + SSO token state, kubectl contexts
+  jx <tool> <command>   run it
+
+Output is TSV with a header; --json anywhere gives the raw payload. An id of `-` reads ids from stdin.
+"""
+import os, re, subprocess, sys
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+TOOLS = os.path.join(ROOT, "tools")
+
+def tools(): return sorted(f[:-3] for f in os.listdir(TOOLS) if f.endswith(".py") and not f.startswith("_"))
+
+def catalogue():
+    for t in tools():
+        doc = re.search(r'"""(.*?)"""', open(os.path.join(TOOLS, t + ".py")).read(), re.S).group(1)
+        for line in doc.splitlines():
+            if line.startswith("  jx "): print(line.strip())
+        print()
+
+def doctor():
+    py = sys.executable
+    subprocess.run([py, os.path.join(TOOLS, "pr.py"), "doctor"])
+    subprocess.run([py, os.path.join(TOOLS, "aws.py"), "whoami"])
+    ctx = subprocess.run(["kubectl", "config", "get-contexts", "-o", "name"], text=True, capture_output=True).stdout.split()
+    print("kubectl contexts:", ", ".join(ctx) if ctx else "none"); print("k: `jx k <context> doctor` checks one cluster")
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("ls", "-h", "--help", "help"): print(__doc__); catalogue(); return
+    if a[0] == "doctor": doctor(); return
+    if a[0] not in tools(): sys.exit(f"jx: no tool {a[0]!r}. tools: {', '.join(tools())}. `jx ls` lists every command.")
+    os.execv(sys.executable, [sys.executable, os.path.join(TOOLS, a[0] + ".py"), *a[1:]])
+
+if __name__ == "__main__": main()

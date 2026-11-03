@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""awsx — AWS CLI lever for agents. TSV by default, --json for the raw payload. Every call runs with TZ=UTC
+"""jx aws — AWS CLI lever for agents. TSV by default, --json for the raw payload. Every call runs with TZ=UTC
 and prints UTC timestamps, so nothing is ever read in local time.
 
-  awsx [-p PROFILE] [--region R] <subcommand>
+  jx aws [-p PROFILE] [--region R] <command>
 
-  whoami                                      account, role ARN, and whether the SSO token behind the profile is still valid
-  cw <namespace> [metric] [--dim K=V ...] [--stat Average,SampleCount] [--since 6h] [--period 300]
+  jx aws whoami                                      account, role ARN, and whether the SSO token behind the profile is still valid
+  jx aws cw <namespace> [metric] [--dim K=V ...] [--stat Average,SampleCount] [--since 6h] [--period 300]
                                               datapoints; without a metric, lists metrics + dimensions in the namespace
-  alarms [--state ALARM] [--prefix NAME]      alarm name, state, since, metric, reason
-  ecr-tags <repo> [--filter SUBSTR] [--limit 20]   newest images first: pushed, tags, digest, size
-  cost [--since 30d] [--group SERVICE] [--granularity DAILY] [--metric UnblendedCost] [--top 15]
-  logs-query <group[,group]> '<insights query>' [--since 1h] [--limit 100]   start, poll, print results
-  eks <cluster> [addons|nodegroups]           cluster version/status, or addon versions, or nodegroup state
+  jx aws alarms [--state ALARM] [--prefix NAME]      alarm name, state, since, metric, reason
+  jx aws ecr-tags <repo> [--filter SUBSTR] [--limit 20]   newest images first: pushed, tags, digest, size
+  jx aws cost [--since 30d] [--group SERVICE] [--granularity DAILY] [--metric UnblendedCost] [--top 15]
+  jx aws logs-query <group[,group]> '<insights query>' [--since 1h] [--limit 100]   start, poll, print results
+  jx aws eks <cluster> [addons|nodegroups]           cluster version/status, or addon versions, or nodegroup state
 
 Gotchas this encodes: `sts get-caller-identity` succeeds on cached role creds for hours after the SSO
 token expired (terraform then fails) — `whoami` reads ~/.aws/sso/cache expiresAt. CloudWatch gauges
@@ -26,7 +26,7 @@ NOT_FOUND = {
     "ecr-tags": "repository not found in this account/region. `aws ecr describe-repositories --query 'repositories[].repositoryName'` lists them; check -p and --region.",
     "eks": "cluster not found in this account/region. `aws eks list-clusters` lists them; check -p and --region.",
     "logs-query": "log group not found. `aws logs describe-log-groups --log-group-name-prefix <prefix> --query 'logGroups[].logGroupName'` lists them.",
-    "cw": "metric or dimension not found. `awsx cw <namespace>` lists metric names with their exact dimension names and values.",
+    "cw": "metric or dimension not found. `jx aws cw <namespace>` lists metric names with their exact dimension names and values.",
 }
 
 def aws(args, a, ok=(0,)):
@@ -36,7 +36,7 @@ def aws(args, a, ok=(0,)):
     if p.returncode not in ok:
         err = p.stderr.strip()
         if re.search(r"token|sso|expired|InvalidGrant|credentials|could not be found|Unable to locate", err, re.I):
-            hint = f"→ `awsx -p {p_ or '<profile>'} whoami`; if the SSO token is expired, `aws sso login --profile {p_ or '<profile>'}`. `aws configure list-profiles` lists profiles."
+            hint = f"→ `jx aws -p {p_ or '<profile>'} whoami`; if the SSO token is expired, `aws sso login --profile {p_ or '<profile>'}`. `aws configure list-profiles` lists profiles."
         elif re.search(r"NotFound|does not exist|NoSuchEntity|not found", err, re.I): hint = "→ " + NOT_FOUND.get(CMD, "check the name, -p and --region")
         elif re.search(r"AccessDenied|not authorized", err, re.I): hint = f"→ this role lacks the permission; try another profile (`aws configure list-profiles`)"
         else: hint = ""
@@ -101,7 +101,7 @@ def cmd_cw(a):
     d = aws(args, a); pts = sorted(d.get("Datapoints", []), key=lambda p: p["Timestamp"])
     rows = [{"time": utc(p["Timestamp"]), **{s: round(p.get(s, float("nan")), 4) for s in stats}, "unit": p.get("Unit", "")} for p in pts]
     emit(rows, ["time", *stats, "unit"], a, d)
-    if not rows: sys.stderr.write(f"0 datapoints: metric/dimension mismatch or no data in the window. `awsx cw {a.namespace}` lists exact metric and dimension names; CloudWatch needs every dimension of the series, not a subset.\n"); sys.exit(1)
+    if not rows: sys.stderr.write(f"0 datapoints: metric/dimension mismatch or no data in the window. `jx aws cw {a.namespace}` lists exact metric and dimension names; CloudWatch needs every dimension of the series, not a subset.\n"); sys.exit(1)
     sys.stderr.write(f"{len(rows)} datapoints, period {a.period}s" + ("  (Sum of a gauge = value × samples; use Average)" if "Sum" in stats and "SampleCount" not in stats else "") + "\n")
 
 def cmd_alarms(a):
@@ -189,7 +189,7 @@ def add_globals(p, suppress=False):
 
 def main():
     global CMD
-    ap = argparse.ArgumentParser(prog="awsx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
+    ap = argparse.ArgumentParser(prog="jx aws", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
     g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
     sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
     sp.add_parser("whoami", parents=[g], help="account, role ARN, and SSO token validity; exit 1 when the token is expired").set_defaults(f=cmd_whoami)

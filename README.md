@@ -7,16 +7,18 @@ command that already emits the answer shape (TSV by default, `--json` for raw pa
 Design rules: stdlib only where possible · machine-readable output · `--dry-run` on anything
 that posts or mutates · `--help` and a `doctor` subcommand per tool · errors name the next command.
 
-| Lever | What it covers |
+| Tool | What it covers |
 |---|---|
-| [`gh_levers/`](gh_levers/) | `pr`: review threads, reply/comment with verify, commits since last review, check rollup. `ci`: Actions runs, jobs by attempt, failed-job log triage, dispatch, wait. |
-| [`k_levers/`](k_levers/) | `k <env>`: pods with waiting reasons, deployment images + GIT_SHA, Karpenter node/nodeclaim census, warning events, grepped logs, rollout, secret keys; `k all` across environments. |
-| [`aws_levers/`](aws_levers/) | `awsx`: SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS cluster/addons/nodegroups. All timestamps UTC. |
+| `jx pr` | review threads with comment ids, verified reply/comment, commits since last review, check rollup, `triage` = checks + failed logs in one call |
+| `jx ci` | Actions runs, jobs by attempt, failed-job log triage, dispatch with `--dry-run`, wait; ids chain via stdin `-` |
+| `jx k` | kubectl by environment: pods with waiting reasons, images + GIT_SHA, Karpenter node census, events, logs, rollout, secrets; `jx k all` fans out |
+| `jx aws` | SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS; every timestamp UTC |
 
-## Install as Claude Code skills
+`jx ls` prints every command on one line each. Dispatcher: `bin/jx`; tools: `tools/*.py`; notes: `docs/`.
+
+## Install
 
 ```bash
-for d in gh_levers k_levers aws_levers; do ln -sfn "$PWD/$d" ~/.claude/skills/$d; done
+ln -sfn "$PWD/bin/jx" /opt/homebrew/bin/jx        # or any PATH dir
+ln -sfn "$PWD" ~/.claude/skills/jx                # one skill entry; SKILL.md at the repo root
 ```
-
-Each lever directory carries a `SKILL.md` so the agent discovers it.
