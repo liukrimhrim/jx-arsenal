@@ -18,6 +18,7 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | `jx git` | git idioms: read a file or listing at origin/main or a PR head without checkout, what changed since main, a guarded `commit` that stages only named paths and refuses the wrong branch, worktrees, archive export, open PRs touching the same files |
 | `jx temporal` | Temporal by environment through a per-call port-forward: counts and lists by type/status/queue/time, describe with the innermost failure, history with failures only, failed-run grouping, task-queue pollers, schedules |
 | `jx oncall` | incident.io and PagerDuty, read-only: who is on call on every schedule, open incidents across both, alerts and alert grouping, one incident with its alerts and timeline, escalations, users, routes, a provider reconciliation count, and a raw `api` GET with pagination. Tokens from env or a configured command, never printed |
+| `jx mem`, `jx tx` | the agent's own bookkeeping: memory files of the current project (list, show, grep, add with a duplicate check, append, edit, doctor for index drift) and session transcripts (sessions, grep, the Bash commands run, one session's messages) |
 
 `jx ls` prints every command on one line each. Dispatcher: `bin/jx`; tools: `tools/*.py`; notes: `docs/`.
 
