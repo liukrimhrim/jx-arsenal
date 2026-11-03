@@ -14,6 +14,7 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | `jx k` | kubectl by environment: pods with waiting reasons, images + GIT_SHA, Karpenter node census, events, logs, rollout, secrets; `jx k all` fans out |
 | `jx aws` | SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS; every timestamp UTC |
 | `jx obs` | Prometheus (AMP) and Loki by environment: PromQL instant/range, metric and label discovery, sample freshness, rules and alerts, LogQL lines and per-bucket counts; `jx obs all` fans out. Hand SigV4, no boto3 |
+| `jx tf` | Terraform roots: discover roots (changed vs main), fmt + validate, lock-free plan summarized to one row per change with the exit code terraform uses, attribute diff of a saved plan, state list, doctor. Never applies |
 
 `jx ls` prints every command on one line each. Dispatcher: `bin/jx`; tools: `tools/*.py`; notes: `docs/`.
 
