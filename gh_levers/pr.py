@@ -14,13 +14,27 @@
 Exit codes: 0 ok · 1 something failed (a failing check, a verify mismatch) · 2 usage/auth.
 Posting (reply/comment) is an outward action: run with --dry-run first, post only with approval.
 """
-import argparse, json, re, subprocess, sys, time
+import argparse, json, re, subprocess, sys, time, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timezone
+
+CMD = ""  # current subcommand, for error hints
+NOT_FOUND = {
+    "threads": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
+    "since": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
+    "ci": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
+    "comment": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
+    "reply": "PR or comment id not found. `pr threads <n>` prints the root comment_id of each thread; reply to that id, not the thread id.",
+}
 
 def sh(args, stdin=None):
     p = subprocess.run(args, input=stdin, text=True, capture_output=True)
     if p.returncode:
-        sys.stderr.write(p.stderr.strip() + "\n"); sys.exit(2 if "auth" in p.stderr or "login" in p.stderr else 1)
+        err = p.stderr.strip() or p.stdout.strip()
+        if re.search(r"auth|login|token|401|403", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
+        elif re.search(r"404|not found|could not resolve", err, re.I): hint, code = "→ " + NOT_FOUND.get(CMD, "check the id"), 1
+        else: hint, code = "", 1
+        sys.stderr.write(f"{err}\n{hint}\n" if hint else err + "\n"); sys.exit(code)
     return p.stdout
 
 def gh(*a, stdin=None): return sh(["gh", *a], stdin)
@@ -141,20 +155,28 @@ def cmd_ci(args):
 def cmd_doctor(args):
     print(gh("auth", "status").strip().splitlines()[1].strip()); print("repo:", repo_of(args)); print("ok")
 
+def add_globals(p, suppress=False):
+    d = {"default": argparse.SUPPRESS} if suppress else {}
+    p.add_argument("--repo", "-R", help="owner/name; default is the current checkout's origin", **d)
+    p.add_argument("--json", action="store_true", help="raw JSON instead of TSV", **d)
+
 def main():
-    ap = argparse.ArgumentParser(prog="pr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", "-R", help="owner/name (default: current checkout)")
-    ap.add_argument("--json", action="store_true", help="raw JSON instead of TSV")
-    sp = ap.add_subparsers(dest="cmd", required=True)
-    p = sp.add_parser("threads"); p.add_argument("n", type=int); p.add_argument("--all", action="store_true", help="include resolved"); p.add_argument("--full", action="store_true", help="full bodies"); p.set_defaults(f=cmd_threads)
-    for name, f in (("reply", cmd_reply), ("comment", cmd_comment)):
-        p = sp.add_parser(name); p.add_argument("n", type=int)
-        if name == "reply": p.add_argument("comment_id", type=int)
-        p.add_argument("--body-file"); p.add_argument("--body"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(f=f)
-    p = sp.add_parser("since"); p.add_argument("n", type=int); p.add_argument("--since", help="ISO timestamp; default = last review by someone else"); p.set_defaults(f=cmd_since)
-    p = sp.add_parser("ci"); p.add_argument("n", type=int); p.add_argument("--wait", action="store_true"); p.add_argument("--failed", action="store_true")
-    p.add_argument("--interval", type=int, default=30); p.add_argument("--timeout", type=int, default=2400); p.set_defaults(f=cmd_ci)
-    sp.add_parser("doctor").set_defaults(f=cmd_doctor)
-    args = ap.parse_args(); args.f(args)
+    global CMD
+    ap = argparse.ArgumentParser(prog="pr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
+    g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
+    sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
+    p = sp.add_parser("threads", parents=[g], help="review threads with comment ids; unresolved only unless --all")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--all", action="store_true", help="include resolved threads"); p.add_argument("--full", action="store_true", help="full comment bodies instead of the first 200 chars"); p.set_defaults(f=cmd_threads)
+    for name, f, h in (("reply", cmd_reply, "reply to a review comment, then re-read it to verify"), ("comment", cmd_comment, "post a top-level PR comment, then re-read it to verify")):
+        p = sp.add_parser(name, parents=[g], help=h); p.add_argument("n", type=int, help="PR number")
+        if name == "reply": p.add_argument("comment_id", type=int, help="root comment_id from `pr threads`")
+        p.add_argument("--body-file", help="file holding the markdown body"); p.add_argument("--body", help="inline body"); p.add_argument("--dry-run", action="store_true", help="print endpoint and body, post nothing"); p.set_defaults(f=f)
+    p = sp.add_parser("since", parents=[g], help="commits and per-file diffstat pushed after the last review by someone else")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--since", help="ISO timestamp; default is the last review submitted by someone other than you"); p.set_defaults(f=cmd_since)
+    p = sp.add_parser("ci", parents=[g], help="check rollup sorted fail > pending > pass; exit 1 if anything failed")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--wait", action="store_true", help="poll until nothing is pending"); p.add_argument("--failed", action="store_true", help="print job_id/run_id of failed checks for `ci failed` / `ci logs`")
+    p.add_argument("--interval", type=int, default=30, help="seconds between polls (30)"); p.add_argument("--timeout", type=int, default=2400, help="give up after this many seconds (2400)"); p.set_defaults(f=cmd_ci)
+    sp.add_parser("doctor", parents=[g], help="auth status and resolved repo").set_defaults(f=cmd_doctor)
+    args = ap.parse_args(); CMD = args.cmd; args.f(args)
 
 if __name__ == "__main__": main()

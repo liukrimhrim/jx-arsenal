@@ -17,16 +17,30 @@ Gotchas this encodes: `sts get-caller-identity` succeeds on cached role creds fo
 token expired (terraform then fails) — `whoami` reads ~/.aws/sso/cache expiresAt. CloudWatch gauges
 summed over a period count samples, not things — default stat is Average plus SampleCount.
 """
-import argparse, configparser, glob, json, os, re, subprocess, sys, time
+import argparse, configparser, glob, json, os, re, subprocess, sys, time, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timedelta, timezone
 
+CMD = ""  # current subcommand, for error hints
+NOT_FOUND = {
+    "ecr-tags": "repository not found in this account/region. `aws ecr describe-repositories --query 'repositories[].repositoryName'` lists them; check -p and --region.",
+    "eks": "cluster not found in this account/region. `aws eks list-clusters` lists them; check -p and --region.",
+    "logs-query": "log group not found. `aws logs describe-log-groups --log-group-name-prefix <prefix> --query 'logGroups[].logGroupName'` lists them.",
+    "cw": "metric or dimension not found. `awsx cw <namespace>` lists metric names with their exact dimension names and values.",
+}
+
 def aws(args, a, ok=(0,)):
-    cmd = ["aws", "--output", "json", "--no-cli-pager"] + (["--profile", a.profile] if a.profile else []) + (["--region", a.region] if a.region else []) + args
+    p_ = a.profile or os.environ.get("AWS_PROFILE")
+    cmd = ["aws", "--output", "json", "--no-cli-pager"] + (["--profile", p_] if p_ else []) + (["--region", a.region] if a.region else []) + args
     p = subprocess.run(cmd, text=True, capture_output=True, env={**os.environ, "TZ": "UTC"})
     if p.returncode not in ok:
         err = p.stderr.strip()
-        if re.search(r"token|sso|expired|InvalidGrant|credentials", err, re.I): err += f"\n  → `awsx -p {a.profile or '<profile>'} whoami`, then `aws sso login --profile {a.profile or '<profile>'}`"
-        sys.exit(err)
+        if re.search(r"token|sso|expired|InvalidGrant|credentials|could not be found|Unable to locate", err, re.I):
+            hint = f"→ `awsx -p {p_ or '<profile>'} whoami`; if the SSO token is expired, `aws sso login --profile {p_ or '<profile>'}`. `aws configure list-profiles` lists profiles."
+        elif re.search(r"NotFound|does not exist|NoSuchEntity|not found", err, re.I): hint = "→ " + NOT_FOUND.get(CMD, "check the name, -p and --region")
+        elif re.search(r"AccessDenied|not authorized", err, re.I): hint = f"→ this role lacks the permission; try another profile (`aws configure list-profiles`)"
+        else: hint = ""
+        sys.exit(f"{err}\n{hint}" if hint else err)
     return json.loads(p.stdout) if p.stdout.strip() else {}
 
 def since(s):
@@ -76,6 +90,7 @@ def cmd_whoami(a):
 def cmd_cw(a):
     if not a.metric:
         ms = aws(["cloudwatch", "list-metrics", "--namespace", a.namespace] + (["--metric-name", a.metric] if a.metric else []), a).get("Metrics", [])
+        if not ms: sys.exit(f"no metrics in namespace {a.namespace!r} for this account/region. Namespaces look like AWS/RDS, AWS/SQS, AWS/ApplicationELB; `aws cloudwatch list-metrics --query 'Metrics[].Namespace' | sort -u` lists the live ones.")
         rows = sorted({(m["MetricName"], ",".join(f"{d['Name']}={d['Value']}" for d in m.get("Dimensions", []))) for m in ms})
         emit([{"metric": m, "dimensions": d} for m, d in rows], ["metric", "dimensions"], a, ms); return
     stats = a.stat.split(",")
@@ -86,6 +101,7 @@ def cmd_cw(a):
     d = aws(args, a); pts = sorted(d.get("Datapoints", []), key=lambda p: p["Timestamp"])
     rows = [{"time": utc(p["Timestamp"]), **{s: round(p.get(s, float("nan")), 4) for s in stats}, "unit": p.get("Unit", "")} for p in pts]
     emit(rows, ["time", *stats, "unit"], a, d)
+    if not rows: sys.stderr.write(f"0 datapoints: metric/dimension mismatch or no data in the window. `awsx cw {a.namespace}` lists exact metric and dimension names; CloudWatch needs every dimension of the series, not a subset.\n"); sys.exit(1)
     sys.stderr.write(f"{len(rows)} datapoints, period {a.period}s" + ("  (Sum of a gauge = value × samples; use Average)" if "Sum" in stats and "SampleCount" not in stats else "") + "\n")
 
 def cmd_alarms(a):
@@ -165,19 +181,27 @@ def cmd_eks(a):
            "public_cidrs": ",".join(c["resourcesVpcConfig"].get("publicAccessCidrs", [])), "auth_mode": c.get("accessConfig", {}).get("authenticationMode"), "support": c.get("upgradePolicy", {}).get("supportType")}
     emit([row], list(row), a, c)
 
+def add_globals(p, suppress=False):
+    d = {"default": argparse.SUPPRESS} if suppress else {}
+    p.add_argument("-p", "--profile", help="AWS profile; default $AWS_PROFILE", **({"default": argparse.SUPPRESS} if suppress else {"default": os.environ.get("AWS_PROFILE")}))
+    p.add_argument("--region", help="override the profile's region", **d)
+    p.add_argument("--json", action="store_true", help="raw AWS JSON instead of TSV", **d)
+
 def main():
-    ap = argparse.ArgumentParser(prog="awsx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-p", "--profile", default=os.environ.get("AWS_PROFILE")); ap.add_argument("--region"); ap.add_argument("--json", action="store_true")
-    sp = ap.add_subparsers(dest="cmd", required=True)
-    sp.add_parser("whoami").set_defaults(f=cmd_whoami)
-    p = sp.add_parser("cw"); p.add_argument("namespace"); p.add_argument("metric", nargs="?"); p.add_argument("--dim", action="append", default=[], metavar="K=V")
-    p.add_argument("--stat", default="Average,SampleCount", help="comma list: Average,Sum,Maximum,Minimum,SampleCount"); p.add_argument("--since", default="6h"); p.add_argument("--period", type=int, default=300); p.set_defaults(f=cmd_cw)
-    p = sp.add_parser("alarms"); p.add_argument("--state", choices=["ALARM", "OK", "INSUFFICIENT_DATA"]); p.add_argument("--prefix"); p.set_defaults(f=cmd_alarms)
-    p = sp.add_parser("ecr-tags"); p.add_argument("repo"); p.add_argument("--filter"); p.add_argument("--limit", type=int, default=20); p.set_defaults(f=cmd_ecr_tags)
-    p = sp.add_parser("cost"); p.add_argument("--since", default="30d"); p.add_argument("--group", help="SERVICE | LINKED_ACCOUNT | USAGE_TYPE | REGION | TAG:key"); p.add_argument("--granularity", default="DAILY", choices=["DAILY", "MONTHLY", "HOURLY"])
-    p.add_argument("--metric", default="UnblendedCost"); p.add_argument("--top", type=int, default=15); p.set_defaults(f=cmd_cost)
-    p = sp.add_parser("logs-query"); p.add_argument("group"); p.add_argument("query"); p.add_argument("--since", default="1h"); p.add_argument("--limit", type=int, default=100); p.add_argument("--timeout", type=int, default=120); p.set_defaults(f=cmd_logs_query)
-    p = sp.add_parser("eks"); p.add_argument("cluster"); p.add_argument("what", nargs="?", choices=["addons", "nodegroups"]); p.set_defaults(f=cmd_eks)
-    a = ap.parse_args(); a.f(a)
+    global CMD
+    ap = argparse.ArgumentParser(prog="awsx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
+    g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
+    sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
+    sp.add_parser("whoami", parents=[g], help="account, role ARN, and SSO token validity; exit 1 when the token is expired").set_defaults(f=cmd_whoami)
+    p = sp.add_parser("cw", parents=[g], help="CloudWatch datapoints, or the metric/dimension list of a namespace when no metric is given")
+    p.add_argument("namespace", help="e.g. AWS/RDS"); p.add_argument("metric", nargs="?", help="metric name; omit to list metrics and dimensions"); p.add_argument("--dim", action="append", default=[], metavar="K=V", help="dimension, repeatable; every dimension of the series is required")
+    p.add_argument("--stat", default="Average,SampleCount", help="comma list of Average,Sum,Maximum,Minimum,SampleCount (Average,SampleCount)"); p.add_argument("--since", default="6h", help="window start: 30m, 6h, 7d or ISO (6h)"); p.add_argument("--period", type=int, default=300, help="seconds per datapoint (300)"); p.set_defaults(f=cmd_cw)
+    p = sp.add_parser("alarms", parents=[g], help="alarms with state, since, metric, reason; ALARM first"); p.add_argument("--state", choices=["ALARM", "OK", "INSUFFICIENT_DATA"], help="only this state"); p.add_argument("--prefix", help="alarm name prefix"); p.set_defaults(f=cmd_alarms)
+    p = sp.add_parser("ecr-tags", parents=[g], help="images of a repository, newest first"); p.add_argument("repo", help="repository name"); p.add_argument("--filter", help="only images with a tag containing this"); p.add_argument("--limit", type=int, default=20, help="max images (20)"); p.set_defaults(f=cmd_ecr_tags)
+    p = sp.add_parser("cost", parents=[g], help="Cost Explorer spend, optionally grouped"); p.add_argument("--since", default="30d", help="window start: 7d, 30d or ISO date (30d)"); p.add_argument("--group", help="SERVICE | LINKED_ACCOUNT | USAGE_TYPE | REGION | TAG:key"); p.add_argument("--granularity", default="DAILY", choices=["DAILY", "MONTHLY", "HOURLY"], help="(DAILY)")
+    p.add_argument("--metric", default="UnblendedCost", help="UnblendedCost | BlendedCost | AmortizedCost | UsageQuantity (UnblendedCost)"); p.add_argument("--top", type=int, default=15, help="keep the N largest groups (15)"); p.set_defaults(f=cmd_cost)
+    p = sp.add_parser("logs-query", parents=[g], help="run a Logs Insights query, poll, print rows"); p.add_argument("group", help="log group, or several comma-separated"); p.add_argument("query", help="Insights query string"); p.add_argument("--since", default="1h", help="window start: 30m, 2h, 3d or ISO (1h)"); p.add_argument("--limit", type=int, default=100, help="max rows when the query has no limit clause (100)"); p.add_argument("--timeout", type=int, default=120, help="seconds to wait for the query (120)"); p.set_defaults(f=cmd_logs_query)
+    p = sp.add_parser("eks", parents=[g], help="cluster summary, or its addons / nodegroups"); p.add_argument("cluster", help="cluster name"); p.add_argument("what", nargs="?", choices=["addons", "nodegroups"], help="addons: versions and health; nodegroups: scaling and versions"); p.set_defaults(f=cmd_eks)
+    a = ap.parse_args(); CMD = a.cmd; a.f(a)
 
 if __name__ == "__main__": main()

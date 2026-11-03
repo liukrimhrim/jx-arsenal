@@ -15,7 +15,8 @@
   {"envs": {"prod": {"context": "arn:aws:eks:...:cluster/x"}, "stage": {"context": "stage-cluster"}}}
 The file also defines the env list `k all` uses. Nothing cluster-specific lives in this script.
 """
-import argparse, base64, contextlib, io, json, os, re, subprocess, sys
+import argparse, base64, contextlib, io, json, os, re, subprocess, sys, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timezone
 
 CFG = os.path.expanduser("~/.config/jx-arsenal/k.json")
@@ -33,6 +34,19 @@ def all_envs():
     if not envs: sys.exit(f"`k all` needs K_ENVS=a,b,c or an envs map in {CFG}")
     return envs
 
+CMD = ""  # current subcommand, for error hints
+NOT_FOUND = {
+    "img": "deployment not found in that namespace. `k <env> img -n <ns>` lists every deployment; `k <env> pods -A | cut -f1 | sort -u` lists namespaces.",
+    "logs": "target not found. Use kind/name (deploy/x, pod/x, sts/x) and the right -n; `k <env> pods -n <ns>` lists pods, `k <env> img -n <ns>` lists deployments.",
+    "rollout": "deployment not found. `k <env> img -n <ns>` lists deployments in that namespace.",
+    "secret": "secret not found in that namespace. `kubectl --context <ctx> -n <ns> get secrets` lists names; check -n.",
+}
+
+def check_ns(env, ns):
+    """A query scoped to a namespace that does not exist returns an empty list, not an error. Make it an error."""
+    if ns and subprocess.run(["kubectl", "--context", context_of(env), "--request-timeout", "20s", "get", "ns", ns], capture_output=True).returncode:
+        sys.exit(f"namespace {ns!r} does not exist in {env}. `k {env} pods -A | cut -f1 | sort -u` lists namespaces.")
+
 def kubectl(args, env, ns=None, all_ns=False, ok=(0,)):
     # namespace flags go AFTER the verb: kubectl treats a leading -A as a plugin name
     cmd = ["kubectl", "--context", context_of(env), "--request-timeout", "20s"] + args + (["-A"] if all_ns else ["-n", ns] if ns else [])
@@ -41,8 +55,10 @@ def kubectl(args, env, ns=None, all_ns=False, ok=(0,)):
         sys.exit(f"{env}: no answer in {os.environ.get('K_TIMEOUT', '45')}s (VPN/tailnet down? wrong context?)  → run `k {env} doctor`")
     if p.returncode not in ok:
         err = p.stderr.strip()
-        hint = "  → run `k {} doctor`".format(env) if re.search(r"context|credential|Unauthorized|token|exec plugin", err, re.I) else ""
-        sys.exit(f"{err}{hint}")
+        if re.search(r"context|credential|Unauthorized|token|exec plugin|forbidden", err, re.I): hint = f"→ run `k {env} doctor`; a cluster behind a VPN/tailnet needs it up first"
+        elif re.search(r"NotFound|not found", err): hint = "→ " + NOT_FOUND.get(CMD, f"`k {env} pods -A` shows what exists")
+        else: hint = ""
+        sys.exit(f"{err}\n{hint}" if hint else err)
     return p.stdout
 
 def kget(kind, env, ns=None, all_ns=False, extra=()):
@@ -69,6 +85,7 @@ def short_image(img):
 def cmd_pods(args):
     extra = ["-l", args.l] if args.l else []
     items = kget("pods", args.env, args.n, args.A, extra)
+    if not items: check_ns(args.env, args.n)
     rows = []
     for p in items:
         cs = p.get("status", {}).get("containerStatuses", []) or []
@@ -90,6 +107,7 @@ def cmd_pods(args):
 # ---------------- img ----------------
 def cmd_img(args):
     items = [json.loads(kubectl(["get", "deploy", args.deploy, "-o", "json"], args.env, args.n))] if args.deploy else kget("deployments", args.env, args.n)
+    if not items: check_ns(args.env, args.n)
     rows = []
     for d in items:
         st = d.get("status", {})
@@ -128,6 +146,7 @@ def cmd_nodes(args):
 # ---------------- events ----------------
 def cmd_events(args):
     items = kget("events", args.env, args.n, args.A)
+    if not items: check_ns(args.env, args.n)
     if args.warn: items = [e for e in items if e.get("type") == "Warning"]
     ts = lambda e: e.get("lastTimestamp") or e.get("eventTime") or e.get("firstTimestamp") or ""
     items.sort(key=ts, reverse=True)
@@ -166,22 +185,26 @@ def cmd_doctor(args):
     print(f"env={args.env} context={ctx} server={v} can-get-pods-all-ns={can} map={'yes' if os.path.exists(CFG) else 'no'}")
 
 def main(argv=None):
+    global CMD
     ap = argparse.ArgumentParser(prog="k", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("env", help="environment / kubectl context, or `all`")
+    ap.add_argument("env", help="environment: a kubectl context name, a key in the map file, or `all`")
     ap.add_argument("--json", action="store_true", help="raw kubectl JSON instead of TSV")
-    sp = ap.add_subparsers(dest="cmd", required=True)
+    g = argparse.ArgumentParser(add_help=False); g.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="raw kubectl JSON instead of TSV")  # accepted after the subcommand too
+    sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
     def ns(p, all_ns=True):
-        p.add_argument("-n", metavar="NS");
+        p.add_argument("-n", metavar="NS", help="namespace; default is the context's namespace")
         if all_ns: p.add_argument("-A", action="store_true", help="all namespaces")
-    p = sp.add_parser("pods"); ns(p); p.add_argument("-l", metavar="SELECTOR"); p.set_defaults(f=cmd_pods)
-    p = sp.add_parser("img"); p.add_argument("deploy", nargs="?"); ns(p, False); p.add_argument("--env-var", default="GIT_SHA"); p.add_argument("--full", action="store_true", help="full image refs"); p.set_defaults(f=cmd_img)
-    p = sp.add_parser("nodes"); p.add_argument("--pools", action="store_true", help="Karpenter nodeclaims grouped by nodepool"); p.set_defaults(f=cmd_nodes)
-    p = sp.add_parser("events"); ns(p); p.add_argument("--warn", action="store_true"); p.add_argument("--limit", type=int, default=50); p.set_defaults(f=cmd_events)
-    p = sp.add_parser("logs"); p.add_argument("target", help="deploy/NAME, pod/NAME, sts/NAME ..."); ns(p, False); p.add_argument("--since", default="10m"); p.add_argument("--grep"); p.add_argument("-C", type=int, default=2); p.add_argument("--tail", type=int, default=2000); p.set_defaults(f=cmd_logs)
-    p = sp.add_parser("rollout"); p.add_argument("target"); ns(p, False); p.add_argument("--timeout", default="300s"); p.set_defaults(f=cmd_rollout)
-    p = sp.add_parser("secret"); p.add_argument("name"); p.add_argument("key"); ns(p, False); p.set_defaults(f=cmd_secret)
-    sp.add_parser("doctor").set_defaults(f=cmd_doctor)
-    args = ap.parse_args(argv)
+    p = sp.add_parser("pods", parents=[g], help="pods, unhealthy first, with waiting reason, restarts, age, node"); ns(p); p.add_argument("-l", metavar="SELECTOR", help="label selector, e.g. app=api"); p.set_defaults(f=cmd_pods)
+    p = sp.add_parser("img", parents=[g], help="image per container of each deployment, plus one env var"); p.add_argument("deploy", nargs="?", help="one deployment; default is every deployment in the namespace"); ns(p, False)
+    p.add_argument("--env-var", default="GIT_SHA", help="container env var to show next to the image (GIT_SHA)"); p.add_argument("--full", action="store_true", help="full image refs with registry and digest"); p.set_defaults(f=cmd_img)
+    p = sp.add_parser("nodes", parents=[g], help="nodes with instance type, zone, pool, capacity type, kubelet version, age"); p.add_argument("--pools", action="store_true", help="Karpenter nodeclaims grouped by nodepool instead of nodes"); p.set_defaults(f=cmd_nodes)
+    p = sp.add_parser("events", parents=[g], help="events newest first"); ns(p); p.add_argument("--warn", action="store_true", help="Warning events only"); p.add_argument("--limit", type=int, default=50, help="max events (50)"); p.set_defaults(f=cmd_events)
+    p = sp.add_parser("logs", parents=[g], help="container logs of a workload, optionally grepped with context"); p.add_argument("target", help="deploy/NAME, pod/NAME, sts/NAME, ds/NAME"); ns(p, False)
+    p.add_argument("--since", default="10m", help="kubectl duration (10m)"); p.add_argument("--grep", help="python regex; prints hits with context"); p.add_argument("-C", type=int, default=2, help="context lines around each hit (2)"); p.add_argument("--tail", type=int, default=2000, help="lines fetched per container before grep (2000)"); p.set_defaults(f=cmd_logs)
+    p = sp.add_parser("rollout", parents=[g], help="rollout status of a workload"); p.add_argument("target", help="deploy/NAME, sts/NAME, ds/NAME"); ns(p, False); p.add_argument("--timeout", default="300s", help="kubectl duration to wait (300s)"); p.set_defaults(f=cmd_rollout)
+    p = sp.add_parser("secret", parents=[g], help="one key of a secret, base64-decoded, to stdout"); p.add_argument("name", help="secret name"); p.add_argument("key", help="data key; a wrong key lists the real ones"); ns(p, False); p.set_defaults(f=cmd_secret)
+    sp.add_parser("doctor", parents=[g], help="context exists, server reachable, version, can-i get pods").set_defaults(f=cmd_doctor)
+    args = ap.parse_args(argv); CMD = args.cmd
     if args.env != "all": args.f(args); return
     if args.cmd in ("secret", "logs", "rollout"): sys.exit(f"`k all {args.cmd}` not supported; one env at a time")
     first = True

@@ -5,22 +5,37 @@
   ci jobs <run-id> [--attempt N]                             jobs of a run; --attempt reads an earlier attempt
   ci logs <job-id> [--grep PAT] [-C N] [--tail N]            one job's log, timestamps stripped
   ci failed <run-id> [--attempt N] [--grep PAT] [-C N]       every failed job of a run: header + matching log lines
-  ci dispatch <workflow> [--ref R] [-f k=v ...] [--wait]     workflow_dispatch, then resolve the new run id
+  ci dispatch <workflow> [--ref R] [-f k=v ...] [--wait] [--dry-run]   workflow_dispatch, then resolve the new run id
   ci wait <run-id> [--interval S] [--timeout S]              block until the run completes; exit 1 unless success
   ci doctor
 
 Why `--attempt`: `gh run view --log-failed` always returns the LATEST attempt; a rerun hides the
 original failure. Why the default grep: a job can fail with no "FAILED" line — match error-ish text.
 """
-import argparse, json, re, subprocess, sys, time
+import argparse, json, re, subprocess, sys, time, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timezone
 
 ERRISH = r"(?i)##\[error\]|\berror\b|traceback|\bfailed\b|exit code [1-9]|exited with|assert"
 
+CMD = ""  # current subcommand, for error hints
+NOT_FOUND = {
+    "runs": "workflow not found. `gh workflow list` shows file names and display names; either works here.",
+    "dispatch": "workflow not found, or it has no workflow_dispatch trigger. `gh workflow list`, then check the workflow file's `on:` block.",
+    "jobs": "run id not found. `ci runs <workflow> [--branch B]` lists run ids; `pr ci <n> --failed` gives run_id per failed check.",
+    "failed": "run id not found. `ci runs <workflow> [--branch B]` lists run ids; `pr ci <n> --failed` gives run_id per failed check.",
+    "wait": "run id not found. `ci runs <workflow> [--branch B]` lists run ids.",
+    "logs": "job id not found, or its log expired (90 days). `ci jobs <run_id>` lists job ids; `pr ci <n> --failed` gives job_id per failed check.",
+}
+
 def sh(args, stdin=None, ok=(0,)):
     p = subprocess.run(args, input=stdin, text=True, capture_output=True)
     if p.returncode not in ok:
-        sys.stderr.write(p.stderr.strip() + "\n"); sys.exit(2 if "auth" in p.stderr or "login" in p.stderr else 1)
+        err = p.stderr.strip() or p.stdout.strip()
+        if re.search(r"auth|login|token|401|403", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
+        elif re.search(r"404|not found|could not resolve", err, re.I): hint, code = "→ " + NOT_FOUND.get(CMD, "check the id"), 1
+        else: hint, code = "", 1
+        sys.stderr.write(f"{err}\n{hint}\n" if hint else err + "\n"); sys.exit(code)
     return p.stdout
 
 def gh(*a, **k): return sh(["gh", *a], **k)
@@ -117,7 +132,8 @@ def cmd_dispatch(args):
     ref = args.ref or sh(["git", "branch", "--show-current"]).strip()
     t0 = datetime.now(timezone.utc).isoformat()
     a = ["workflow", "run", args.workflow, "--ref", ref] + R(args)
-    for kv in args.f: a += ["-f", kv]
+    for kv in args.inputs: a += ["-f", kv]
+    if args.dry_run: print("DRY RUN: gh " + " ".join(a) + f"\n  → triggers a real run of {args.workflow} on {ref}; drop --dry-run to do it"); return
     gh(*a)
     for _ in range(12):
         time.sleep(5)
@@ -133,19 +149,30 @@ def cmd_dispatch(args):
 def cmd_doctor(args):
     print(gh("auth", "status").strip().splitlines()[1].strip()); print("repo:", repo_of(args)); print("ok")
 
+def add_globals(p, suppress=False):
+    d = {"default": argparse.SUPPRESS} if suppress else {}
+    p.add_argument("--repo", "-R", help="owner/name; default is the current checkout's origin", **d)
+    p.add_argument("--json", action="store_true", help="raw JSON instead of TSV", **d)
+
 def main():
-    ap = argparse.ArgumentParser(prog="ci", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", "-R", help="owner/name (default: current checkout)")
-    ap.add_argument("--json", action="store_true", help="raw JSON instead of TSV")
-    sp = ap.add_subparsers(dest="cmd", required=True)
-    p = sp.add_parser("runs"); p.add_argument("workflow"); p.add_argument("--branch"); p.add_argument("--limit", type=int, default=10); p.add_argument("--status"); p.set_defaults(f=cmd_runs)
-    p = sp.add_parser("jobs"); p.add_argument("run_id", type=int); p.add_argument("--attempt", type=int); p.set_defaults(f=cmd_jobs)
-    p = sp.add_parser("logs"); p.add_argument("job_id", type=int); p.add_argument("--grep"); p.add_argument("-C", type=int, default=2); p.add_argument("--tail", type=int, default=200); p.set_defaults(f=cmd_logs)
-    p = sp.add_parser("failed"); p.add_argument("run_id", type=int); p.add_argument("--attempt", type=int); p.add_argument("--grep", default=ERRISH); p.add_argument("-C", type=int, default=2); p.add_argument("--max-lines", type=int, default=120); p.set_defaults(f=cmd_failed)
-    p = sp.add_parser("dispatch"); p.add_argument("workflow"); p.add_argument("--ref"); p.add_argument("-f", action="append", default=[], metavar="k=v"); p.add_argument("--wait", action="store_true")
-    p.add_argument("--interval", type=int, default=30); p.add_argument("--timeout", type=int, default=3600); p.set_defaults(f=cmd_dispatch)
-    p = sp.add_parser("wait"); p.add_argument("run_id", type=int); p.add_argument("--interval", type=int, default=30); p.add_argument("--timeout", type=int, default=3600); p.set_defaults(f=cmd_wait)
-    sp.add_parser("doctor").set_defaults(f=cmd_doctor)
-    args = ap.parse_args(); args.f(args)
+    global CMD
+    ap = argparse.ArgumentParser(prog="ci", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
+    g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
+    sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
+    p = sp.add_parser("runs", parents=[g], help="recent runs of a workflow, newest first")
+    p.add_argument("workflow", help="workflow file name (ci.yml) or display name"); p.add_argument("--branch", help="only runs on this branch"); p.add_argument("--limit", type=int, default=10, help="max runs (10)"); p.add_argument("--status", help="queued | in_progress | completed | success | failure | cancelled"); p.set_defaults(f=cmd_runs)
+    p = sp.add_parser("jobs", parents=[g], help="jobs of a run, failed first")
+    p.add_argument("run_id", type=int); p.add_argument("--attempt", type=int, help="read this attempt instead of the latest; 1 = the original failure after a rerun"); p.set_defaults(f=cmd_jobs)
+    p = sp.add_parser("logs", parents=[g], help="one job's log, timestamps and ANSI stripped")
+    p.add_argument("job_id", type=int); p.add_argument("--grep", help="python regex; prints matching lines with context instead of the tail"); p.add_argument("-C", type=int, default=2, help="context lines around each --grep hit (2)"); p.add_argument("--tail", type=int, default=200, help="lines to print without --grep (200)"); p.set_defaults(f=cmd_logs)
+    p = sp.add_parser("failed", parents=[g], help="every failed job of a run: failed steps plus error-ish log lines in context")
+    p.add_argument("run_id", type=int); p.add_argument("--attempt", type=int, help="read this attempt; 1 = the original failure after a rerun"); p.add_argument("--grep", default=ERRISH, help="regex for log lines to show (default matches error/traceback/failed/exit code)"); p.add_argument("-C", type=int, default=2, help="context lines around each hit (2)"); p.add_argument("--max-lines", type=int, default=120, help="cap on printed lines per job (120)"); p.set_defaults(f=cmd_failed)
+    p = sp.add_parser("dispatch", parents=[g], help="workflow_dispatch a workflow and resolve the new run id; --dry-run shows the command")
+    p.add_argument("workflow", help="workflow file name"); p.add_argument("--ref", help="branch or tag; default is the current branch"); p.add_argument("-f", dest="inputs", action="append", default=[], metavar="k=v", help="workflow input, repeatable"); p.add_argument("--wait", action="store_true", help="block until the run completes")
+    p.add_argument("--dry-run", action="store_true", help="print the gh command, trigger nothing"); p.add_argument("--interval", type=int, default=30, help="seconds between polls when waiting (30)"); p.add_argument("--timeout", type=int, default=3600, help="give up waiting after this many seconds (3600)"); p.set_defaults(f=cmd_dispatch)
+    p = sp.add_parser("wait", parents=[g], help="block until a run completes; exit 0 only on success")
+    p.add_argument("run_id", type=int); p.add_argument("--interval", type=int, default=30, help="seconds between polls (30)"); p.add_argument("--timeout", type=int, default=3600, help="give up after this many seconds (3600)"); p.set_defaults(f=cmd_wait)
+    sp.add_parser("doctor", parents=[g], help="auth status and resolved repo").set_defaults(f=cmd_doctor)
+    args = ap.parse_args(); CMD = args.cmd; args.f(args)
 
 if __name__ == "__main__": main()
