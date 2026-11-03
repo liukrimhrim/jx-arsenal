@@ -13,6 +13,7 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | `jx ci` | Actions runs, jobs by attempt, failed-job log triage, dispatch with `--dry-run`, wait; ids chain via stdin `-` |
 | `jx k` | kubectl by environment: pods with waiting reasons, images + GIT_SHA, Karpenter node census, events, logs, rollout, secrets; `jx k all` fans out |
 | `jx aws` | SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS; every timestamp UTC |
+| `jx obs` | Prometheus (AMP) and Loki by environment: PromQL instant/range, metric and label discovery, sample freshness, rules and alerts, LogQL lines and per-bucket counts; `jx obs all` fans out. Hand SigV4, no boto3 |
 
 `jx ls` prints every command on one line each. Dispatcher: `bin/jx`; tools: `tools/*.py`; notes: `docs/`.
 
