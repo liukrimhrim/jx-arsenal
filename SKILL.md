@@ -1,6 +1,6 @@
 ---
 name: jx
-description: One CLI for the loops agents otherwise glue by hand — PR review threads and verified replies, CI run/job/log triage, kubectl across environments, AWS CloudWatch/ECR/cost/Logs Insights/EKS, Prometheus (AMP) and Loki queries by environment, Terraform check/plan/diff per root, git reads at a ref and a guarded commit, Temporal counts/failures/history by environment, incident.io and PagerDuty on-call, incidents and alerts, the agent's own memory files and session transcripts. Run `jx ls` once to see every command. Use it instead of gh/kubectl/aws piped into python heredocs; chain with stdin `-`, and prefer `--wait` and `jx pr triage` so one call finishes a loop.
+description: One CLI for the loops agents otherwise glue by hand — PR review threads and verified replies, CI run/job/log triage, kubectl across environments, AWS CloudWatch/ECR/cost/Logs Insights/EKS, Prometheus (AMP) and Loki queries by environment, Terraform check/plan/diff per root, git reads at a ref and a guarded commit, Temporal counts/failures/history by environment, incident.io and PagerDuty on-call, incidents and alerts, the agent's own memory files and session transcripts, Modal apps/containers/logs/cost. Run `jx ls` once to see every command. Use it instead of gh/kubectl/aws piped into python heredocs; chain with stdin `-`, and prefer `--wait` and `jx pr triage` so one call finishes a loop.
 ---
 
 # jx
@@ -31,6 +31,7 @@ jx temporal prod failed --since 6h --group                 # what is failing and
 jx oncall who                                              # who is paged first on every schedule, both providers
 jx mem ls --grep 'commit|branch'                            # recall before writing; jx mem add refuses near-duplicates
 jx tx cmds --grep kubectl --since 7d                        # what did past sessions actually run
+jx modal containers my-app --watch 300                      # container count sampled over time, no poll loop
 ```
 
 Column names are argument names (`run_id`, `job_id`, `comment_id`), so `cut`/`awk` are rarely
