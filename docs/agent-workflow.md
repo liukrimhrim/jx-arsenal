@@ -1,7 +1,7 @@
 # Mechanical work in one command
 
 These commands replace repeated collection and reporting. They do not choose tests,
-judge a review finding, approve an external action, or certify GPU behavior.
+judge a review finding, approve an external action, or establish runtime behavior.
 
 ## Delegation guard (Codex)
 
@@ -52,9 +52,20 @@ jx review 76 --since REVIEWED_SHA --previous /tmp/pr76-before/snapshot.json --ou
 ```
 
 The first command saves the PR body, all top-level comments, review bodies and inline
-comments, exact-head source snapshot, code diff, and grouped diffstat. Generated evidence
-and locks are listed in the diffstat but excluded from the code patch; inspect them
-separately when relevant. `--paths` limits the source export.
+comments, exact-head source snapshot, code diff, and grouped diffstat. All changed
+files are included unless the checkout root contains `.jx/review.json`:
+
+```json
+{"exclude": ["build-output/**"]}
+```
+
+Patterns use Git's root-relative `glob` pathspec syntax (`*` stays within one path
+component; `**/` spans zero or more directories). Git applies the same exclusions
+to full/delta patches and file grouping. Excluded files remain in the source tree
+and grouped diffstat; inspect them separately when relevant. Configuration comes
+from the local checkout, not the PR branch. The effective list is printed and saved
+in `snapshot.json`; invalid JSON or an invalid config shape fails instead of silently
+using defaults. Missing config means no exclusions. `--paths` limits the source export.
 
 For a status/feedback recheck, skip the source export:
 
@@ -69,7 +80,7 @@ unchanged, not that findings were fixed or CI passed. Exit 0 means a snapshot wa
 or inputs changed. Read `feedback.md` for actual findings. The snapshot is an observation,
 not an atomic transaction or authorization.
 
-When an output directory is reused for different source inputs, old source/patch files
+When source inputs or effective exclusions change, old source/patch files
 are removed even in `--check-only` mode. The snapshot's `source` field is null until a
 full export succeeds; new metadata cannot silently label an old source tree.
 
@@ -100,10 +111,8 @@ dependencies are not. Receipts are historical observations, never cached permiss
 to skip tests after a change. Commands/outputs may contain sensitive data: pass secrets
 through the environment, not command arguments, and inspect logs before sharing them.
 
-The command runs with the caller's normal permissions. For guarded OCRia offline
-verification, existing feature checks and mutation cleanup, use
-`.claude/skills/verify-ocria-inference/scripts/verify-ocria` from the intended checkout.
-This wrapper is not a replacement for its isolation or cleanup.
+The command runs with the caller's normal permissions. Repository-specific isolation,
+verification and cleanup belong in that repository's tools and instructions.
 
 ## CI
 

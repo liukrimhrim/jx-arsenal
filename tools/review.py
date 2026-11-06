@@ -10,8 +10,8 @@ branches, creates worktrees or posts comments. Writes a bundle to DIR
 (default $TMPDIR/review-prep/OWNER/REPO/pr<N>, reused for the same PR):
 
   tree/             snapshot of the whole repo at the PR head (--paths limits it)
-  diff-code.patch   merge-base..head without evidence, lock and checksum files
-  diffstat.txt      every changed file; generated files grouped per directory
+  diff-code.patch   merge-base..head with repository-configured exclusions
+  diffstat.txt      every changed file; excluded files grouped per directory
   delta-code.patch  --since only: since..head (same exclusions; limited to the PR's own
                     files when the base branch was merged in since then)
   range-diff.txt    --since only, when the branch was rebased
@@ -24,9 +24,13 @@ a clean checkout. It does not push. This is for the author's checkout before rep
 Exit codes: 0 captured/changed; 1 local/published mismatch; 3 review inputs unchanged;
 2 usage, git or gh failure.
 Exit 3 says nothing about CI success, correctness, or whether findings were addressed.
+Optional .jx/review.json at the checkout root sets {"exclude": ["GIT_GLOB", ...]}.
+Without this file, all changed files are included. Effective exclusions are saved
+in snapshot.json; changing them invalidates old patches even at the same PR head.
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -36,8 +40,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ponytail: fixed list of this workflow's generated files; make it a flag when a second repo needs another list.
-NOISE = re.compile(r"(^|/)docs/evidence/|(^|/)locks/|\.sha256$|(^|/)SHA256SUMS$|\.lock$")
+CONFIG = Path(".jx/review.json")
 STANDARDS = {"AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "CODING_STANDARDS.md", "CONTEXT.md", "README.md"}
 MARKER = ".review-prep"
 FIELDS = ("number,title,body,state,isDraft,url,author,headRefName,baseRefName,headRefOid,baseRefOid,"
@@ -67,6 +70,7 @@ def changes(before, after):
         "base": before["pr"]["baseRefOid"] != after["pr"]["baseRefOid"],
         "description": any(before["pr"].get(k) != after["pr"].get(k) for k in ("title", "body")),
         "state": before["pr"]["state"] != after["pr"]["state"],
+        "exclusions": before.get("exclude", []) != after["exclude"],
         "feedback": {"added": sorted(new.keys() - old.keys()), "removed": sorted(old.keys() - new.keys()),
                      "edited": sorted(k for k in old.keys() & new.keys() if old[k] != new[k])},
     }
@@ -88,49 +92,60 @@ def git(*args, ok=(0,)):
     return run("git", *args, ok=ok).strip()
 
 
-def is_noise(path):
-    return bool(NOISE.search(path))
+def exclusions():
+    if not CONFIG.exists():
+        return []
+    config = json.loads(CONFIG.read_text())
+    if (not isinstance(config, dict) or set(config) != {"exclude"}
+            or not isinstance(config["exclude"], list)
+            or any(not isinstance(p, str) or not p.strip() for p in config["exclude"])):
+        die(f'{CONFIG} must contain only {{"exclude": ["GIT_GLOB", ...]}}')
+    return config["exclude"]
+
+
+def exclude_specs(exclude):
+    return [f":(top,exclude,glob){pattern}" for pattern in exclude]
 
 
 def when(iso):
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
-def numstat(a, b):
+def numstat(a, b, exclude=()):
     rows = []
-    for line in git("diff", "--numstat", "--no-renames", a, b).splitlines():
+    for line in git("diff", "--numstat", "--no-renames", a, b, "--", ".", *exclude_specs(exclude)).splitlines():
         add, dele, path = line.split("\t", 2)
         rows.append((0 if add == "-" else int(add), 0 if dele == "-" else int(dele), path))
     return rows
 
 
-def stat_lines(rows):
-    """Code files one per line; generated files folded to one line per directory."""
-    code = [r for r in rows if not is_noise(r[2])]
+def stat_lines(rows, included=None):
+    """Included files one per line; excluded files folded to one line per directory."""
+    included = {r[2] for r in rows} if included is None else included
+    code = [r for r in rows if r[2] in included]
     folded = defaultdict(lambda: [0, 0, 0])
     for add, dele, path in rows:
-        if is_noise(path):
+        if path not in included:
             key = "/".join(path.split("/")[:3]) if path.count("/") >= 3 else path.rsplit("/", 1)[0] or path
             f = folded[key]
             f[0] += add; f[1] += dele; f[2] += 1
     out = [f"+{a:<6} -{d:<6} {p}" for a, d, p in sorted(code, key=lambda r: -r[0])]
-    out += [f"+{a:<6} -{d:<6} {k}/  ({n} generated files, excluded from the patch)" for k, (a, d, n) in sorted(folded.items())]
+    out += [f"+{a:<6} -{d:<6} {k}/  ({n} files excluded from the patch)" for k, (a, d, n) in sorted(folded.items())]
     return code, out
 
 
-def write_patch(path, a, b, paths=(".",)):
-    patch = run("git", "diff", a, b, "--", *paths, ":(exclude)docs/evidence", ":(exclude,glob)**/locks/**",
-                ":(exclude,glob)**/*.sha256", ":(exclude,glob)**/SHA256SUMS", ":(exclude,glob)**/*.lock")
+def write_patch(path, a, b, paths=(".",), exclude=()):
+    patch = run("git", "diff", a, b, "--", *paths, *exclude_specs(exclude))
     path.write_text(patch)
     return len(patch)
 
 
 def selftest():
-    assert is_noise("docs/evidence/p1/x.json") and is_noise("cdl_p5/port/locks/L.json") and is_noise("docs/EVIDENCE.sha256")
-    assert not is_noise("cdl_p5/port/evidence.py") and not is_noise("cdl_p5/port/tests/test_lock.py")
     assert when("2026-11-05T16:00:00-08:00") == when("2026-11-06T00:00:00Z")
-    code, lines = stat_lines([(5, 1, "a/b/c.py"), (9, 0, "docs/evidence/r1/x.json"), (1, 0, "docs/evidence/r1/y.json")])
-    assert [r[2] for r in code] == ["a/b/c.py"] and "2 generated files" in lines[-1]
+    rows = [(5, 1, "a/b/c.py"), (9, 0, "build/out/x.json"), (1, 0, "build/out/y.json")]
+    code, lines = stat_lines(rows, {"a/b/c.py"})
+    assert [r[2] for r in code] == ["a/b/c.py"] and "2 files excluded" in lines[-1]
+    assert stat_lines(rows)[0] == rows
     print("selftest ok")
 
 
@@ -150,16 +165,22 @@ def main():
     if args.pr is None:
         ap.error("pr number is required")
 
+    args.out = str(Path(args.out).resolve()) if args.out else None
+    args.previous = str(Path(args.previous).resolve()) if args.previous else None
+    os.chdir(git("rev-parse", "--show-toplevel"))
+    exclude = exclusions()
+
     pr = json.loads(run("gh", "pr", "view", str(args.pr), "--json", FIELDS))
     owner, name = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/", pr["url"]).groups()
     head, base = pr["headRefOid"], pr["baseRefName"]
     out = Path(args.out or Path(tempfile.gettempdir()) / "review-prep" / owner / name / f"pr{args.pr}").resolve()
     if out.exists() and any(out.iterdir()) and not (out / MARKER).exists():
         die(f"{out} exists, is not empty and was not made by review-prep; pass another --out")
-    source = {"url": pr["url"], "head": head, "base": pr["baseRefOid"], "merge": pr.get("mergeCommit")}
+    source = {"url": pr["url"], "head": head, "base": pr["baseRefOid"], "merge": pr.get("mergeCommit"),
+              "exclude": exclude}
     old_source = json.loads((out / "snapshot.json").read_text()).get("source") if (out / "snapshot.json").exists() else None
     snapshot = {"captured_at": datetime.now(timezone.utc).isoformat(), "pr": pr,
-                "feedback": feedback(owner, name, args.pr), "source": old_source}
+                "feedback": feedback(owner, name, args.pr), "source": old_source, "exclude": exclude}
     snapshot["changes"] = changes(json.loads(Path(args.previous).read_text()), snapshot) if args.previous else None
     if old_source != source:
         if (out / "tree").exists():
@@ -187,6 +208,7 @@ def main():
     print(f"state: {pr['state']}{' draft' if pr['isDraft'] else ''}  mergeable: {pr['mergeable']} {pr['mergeStateStatus']}")
     print(f"head: {head}  ({pr['headRefName']})")
     print(f"Review-Key: github.com/{owner}/{name}@{head}")
+    print(f"review exclusions: {json.dumps(exclude)}")
     checks = pr.get("statusCheckRollup") or []
     print("checks: " + ("; ".join(f"{c.get('workflowName') or c.get('context')}/{c.get('name', '')}="
                                    f"{c.get('conclusion') or c.get('status') or c.get('state')}" for c in checks) or "none"))
@@ -195,7 +217,7 @@ def main():
     if snapshot["changes"] is not None:
         delta = snapshot["changes"]
         print("changes: " + json.dumps(delta, sort_keys=True))
-        unchanged = not any(delta[k] for k in ("head", "base", "description", "state")) and not any(delta["feedback"].values())
+        unchanged = not any(delta[k] for k in ("head", "base", "description", "state", "exclusions")) and not any(delta["feedback"].values())
     print(f"snapshot: {out / 'snapshot.json'}")
     if args.local:
         print("local: " + json.dumps(snapshot["local"], sort_keys=True))
@@ -225,11 +247,12 @@ def main():
         (out / stale_file).unlink(missing_ok=True)
 
     rows = numstat(mb, head)
-    code, lines = stat_lines(rows)
+    included = {r[2] for r in numstat(mb, head, exclude)} if exclude else None
+    code, lines = stat_lines(rows, included)
     (out / "diffstat.txt").write_text("\n".join(lines) + "\n")
-    size = write_patch(out / "diff-code.patch", mb, head)
+    size = write_patch(out / "diff-code.patch", mb, head, exclude=exclude)
     commits = git("log", "--oneline", f"{mb}..{head}").splitlines()
-    print(f"commits: {len(commits)}  files: {len(rows)} ({len(code)} code, {len(rows) - len(code)} generated)  "
+    print(f"commits: {len(commits)}  files: {len(rows)} ({len(code)} included, {len(rows) - len(code)} excluded)  "
           f"+{sum(r[0] for r in rows)} -{sum(r[1] for r in rows)}  diff-code.patch: {size} bytes")
     for line in lines[:30]:
         print("  " + line)
@@ -242,9 +265,11 @@ def main():
             # If the base was merged in after `since`, a plain since..head diff is mostly the base's changes.
             base_moved = git("merge-base", base_tip, since) != mb
             own = [r[2] for r in code] if base_moved else ["."]
-            dsize = write_patch(out / "delta-code.patch", since, head, own) if own else 0
+            dsize = write_patch(out / "delta-code.patch", since, head, own, exclude=exclude) if own else 0
             own_set = {r[2] for r in code}
-            _, dlines = stat_lines([r for r in numstat(since, head) if not base_moved or r[2] in own_set])
+            delta_rows = [r for r in numstat(since, head) if not base_moved or r[2] in own_set]
+            delta_included = {r[2] for r in numstat(since, head, exclude)} if exclude else None
+            _, dlines = stat_lines(delta_rows, delta_included)
             note = " (base merged in since then; delta limited to this PR's files)" if base_moved else ""
             print(f"since {since[:9]}: {len(delta)} new commits, delta-code.patch: {dsize} bytes{note}")
             for line in delta[:15] + ["--"] + dlines[:20]:
