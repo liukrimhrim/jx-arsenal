@@ -133,6 +133,113 @@ print(json.dumps(value))
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn('feedback', again.stdout.lower())
 
+    def add_review_files(self):
+        paths = ['build-output/run/report.json', 'package/locks/data.json', 'root.sha256',
+                 'package/nested.sha256', 'SHA256SUMS', 'package/SHA256SUMS',
+                 'root.lock', 'package/nested.lock', 'package/test_lock.py', 'change.py']
+        for path in paths:
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('second revision\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'review paths')
+        self.git('push', '-q', 'origin', 'topic', 'HEAD:refs/pull/7/head')
+        self.fixture['pr']['headRefOid'] = self.git('rev-parse', 'HEAD')
+        self.save_fixture()
+        return paths
+
+    def set_review_exclusions(self, patterns):
+        config = self.repo / '.jx/review.json'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text(json.dumps({'exclude': patterns}))
+        return config
+
+    def test_unconfigured_repo_includes_artifacts_and_locks(self):
+        paths = self.add_review_files()
+        out = self.base / 'unfiltered'
+        result = self.cli('review', 7, '--out', out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        patch = (out / 'diff-code.patch').read_text()
+        for path in paths:
+            self.assertIn(f'diff --git a/{path} b/{path}', patch)
+        self.assertEqual(json.loads((out / 'snapshot.json').read_text())['exclude'], [])
+        self.assertNotIn('files excluded', (out / 'diffstat.txt').read_text())
+
+    def test_config_filters_full_delta_and_stats_with_real_git_globs(self):
+        paths = self.add_review_files()
+        patterns = ['build-output/**', '**/locks/**', '**/*.sha256', '**/SHA256SUMS', '**/*.lock']
+        self.set_review_exclusions(patterns)
+        out = self.base / 'filtered'
+        result = self.cli('review', 7, '--since', self.head, '--out', out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for artifact in ('diff-code.patch', 'delta-code.patch'):
+            patch = (out / artifact).read_text()
+            for path in paths[:-2]:
+                self.assertNotIn(f'diff --git a/{path} b/{path}', patch)
+                self.assertTrue((out / 'tree' / path).is_file())
+            for path in paths[-2:]:
+                self.assertIn(f'diff --git a/{path} b/{path}', patch)
+        stats = (out / 'diffstat.txt').read_text()
+        self.assertIn('files excluded', stats)
+        self.assertIn('package/test_lock.py', stats)
+        self.assertEqual(json.loads((out / 'snapshot.json').read_text())['exclude'], patterns)
+
+    def test_config_change_and_removal_invalidate_same_head_artifacts(self):
+        self.add_review_files()
+        out = self.base / 'reused-config'
+        first = self.cli('review', 7, '--out', out)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self.base / 'before-config.json'
+        before.write_bytes((out / 'snapshot.json').read_bytes())
+        config = self.set_review_exclusions(['build-output/**'])
+        changed = self.cli('review', 7, '--check-only', '--previous', before, '--out', out)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        snapshot = json.loads((out / 'snapshot.json').read_text())
+        self.assertTrue(snapshot['changes']['exclusions'])
+        self.assertIsNone(snapshot['source'])
+        self.assertFalse((out / 'diff-code.patch').exists())
+        self.assertFalse((out / 'tree').exists())
+        rebuilt = self.cli('review', 7, '--out', out)
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+        self.assertNotIn('build-output/run/report.json', (out / 'diff-code.patch').read_text())
+        before.write_bytes((out / 'snapshot.json').read_bytes())
+        config.unlink()
+        removed = self.cli('review', 7, '--previous', before, '--out', out)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertTrue(json.loads((out / 'snapshot.json').read_text())['changes']['exclusions'])
+        self.assertIn('build-output/run/report.json', (out / 'diff-code.patch').read_text())
+
+    def test_config_errors_do_not_silently_fall_back(self):
+        config = self.set_review_exclusions([])
+        for value in ('{broken', '[]', '{"excludes": []}', '{"exclude": "*.lock"}', '{"exclude": [4]}'):
+            with self.subTest(value=value):
+                config.write_text(value)
+                result = self.cli('review', 7, '--check-only', '--out', self.base / 'invalid-config')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse((self.base / 'invalid-config').exists())
+
+    def test_legacy_snapshot_without_exclusion_provenance_requires_review(self):
+        first, before = self.snapshot('legacy')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        legacy = json.loads(before.read_text())
+        del legacy['exclude']  # Older clients applied implicit exclusions without recording them.
+        before.write_text(json.dumps(legacy))
+        changed, after = self.snapshot('after-upgrade', '--previous', before)
+        self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+        self.assertTrue(json.loads(after.read_text())['changes']['exclusions'])
+
+    def test_config_is_root_relative_and_output_is_caller_relative(self):
+        self.add_review_files()
+        self.set_review_exclusions(['build-output/**'])
+        subdir = self.repo / 'package'
+        result = subprocess.run([sys.executable, str(JX), 'review', '7', '--out', 'review-bundle'],
+                                cwd=subdir, env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = subdir / 'review-bundle'
+        patch = (out / 'diff-code.patch').read_text()
+        self.assertIn('root.lock', patch)
+        self.assertNotIn('build-output/run/report.json', patch)
+
     def test_local_published_identity_and_dirty_checkout(self):
         result, snapshot = self.snapshot('published', '--local')
         self.assertEqual(result.returncode, 0, result.stderr)

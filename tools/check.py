@@ -9,7 +9,6 @@ DIR must be new; default is a temporary directory. {out} in COMMAND expands to D
 cases, not console text. No command selection, automatic retries or cached PASS.
 Full output stays in output.log; stdout contains only a short result and file paths.
 Commands run with their normal environment and permissions; this is not a sandbox.
-For guarded OCRia runs and mutation cleanup, use the existing verify-ocria script.
 """
 import argparse
 from datetime import datetime, timezone
