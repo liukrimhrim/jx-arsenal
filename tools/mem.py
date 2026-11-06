@@ -51,7 +51,7 @@ def emit(rows, header, a): print(json.dumps(rows, indent=1)) if a.json else tsv(
 
 def find(d, name):
     ms = [m for m in load(d) if m["name"] == name or m["file"][:-3] == name or m["file"] == name]
-    if not ms: sys.exit(f"no memory named {name!r}; `jx mem ls --grep {name}` searches names and descriptions")
+    if not ms: sys.exit(f"no memory named {name!r}\n→ `jx mem ls --grep {name}` searches names and descriptions")
     return ms[0]
 
 def cmd_ls(a):
@@ -80,8 +80,9 @@ def cmd_doctor(a):
     via_hub = {t for f in hubs for t in links(open(os.path.join(d, f)).read())} - direct
     linked = direct | via_hub
     if a.fix_index:
-        missing = [m for m in mems if m["file"] not in linked]
-        append_index(d, [index_line(m["file"], m["name"], m["description"]) for m in missing]); linked |= {m["file"] for m in missing}
+        missing = [m for m in mems if m["file"] not in linked]; new_lines = [index_line(m["file"], m["name"], m["description"]) for m in missing]
+        if a.dry_run: print("\n".join(new_lines)); sys.stderr.write(f"DRY RUN: {len(new_lines)} index lines would be appended to MEMORY.md\n"); return
+        append_index(d, new_lines); linked |= {m["file"] for m in missing}
         idx = open(os.path.join(d, "MEMORY.md")).read(); sys.stderr.write(f"added {len(missing)} index lines\n")
     rows = [{"issue": "unreachable: not in MEMORY.md nor in a hub it links", "file": f} for f in sorted(files - linked)]
     rows += [{"issue": "index points at missing file", "file": f} for f in sorted(linked - files)]
@@ -115,12 +116,15 @@ def cmd_add(a):
     body = body_arg(a).strip()
     if a.link: body += "\n\nRelated: " + ", ".join(f"[[{l}]]" for l in a.link)
     text = f"---\nname: {slug}\ndescription: {a.desc}\nmetadata:\n  type: {a.type}\n---\n\n{body}\n"
-    line = index_line(file, slug, a.desc); open(os.path.join(d, file), "w").write(text); append_index(d, [line])
+    line = index_line(file, slug, a.desc)
+    if a.dry_run: print(f"DRY RUN: would write {os.path.join(d, file)} and append to MEMORY.md:\n{line}\n---\n{text}", end=""); return
+    open(os.path.join(d, file), "w").write(text); append_index(d, [line])
     emit([{"file": file, "index_line": line}], ["file", "index_line"], a)
 
 def cmd_append(a):
-    d = mem_dir(a); p = os.path.join(d, find(d, a.name)["file"])
-    with open(p, "a") as fh: fh.write(f"\n\n**{today()} addendum:** {body_arg(a).strip()}\n")
+    d = mem_dir(a); p = os.path.join(d, find(d, a.name)["file"]); addendum = f"\n\n**{today()} addendum:** {body_arg(a).strip()}\n"
+    if a.dry_run: print(f"DRY RUN: would append to {p}:{addendum}", end=""); return
+    with open(p, "a") as fh: fh.write(addendum)
     emit([{"file": os.path.basename(p), "lines": len(open(p).read().splitlines())}], ["file", "lines"], a)
 
 def cmd_edit(a):
@@ -135,8 +139,9 @@ def cmd_edit(a):
         if not n: sys.exit(f"{file} has no `description:` frontmatter line")
         changed.append("description"); ip = os.path.join(d, "MEMORY.md"); idx = open(ip).read()
         idx, n = re.subn(r"(\]\(" + re.escape(file) + r"\)\s*—\s*)[^·\n]*", lambda m: m.group(1) + a.desc[:80], idx, count=1)
-        if n: open(ip, "w").write(idx); changed.append("index hook")
+        if n: (None if a.dry_run else open(ip, "w").write(idx)); changed.append("index hook")
         else: sys.stderr.write(f"no `]({file}) — hook` index line to rewrite; `jx mem doctor` lists index issues\n")
+    if a.dry_run: sys.stderr.write(f"DRY RUN: {file} would change: {', '.join(changed)}\n"); print(text, end=""); return
     open(p, "w").write(text); emit([{"file": file, "changed": ", ".join(changed)}], ["file", "changed"], a)
 
 def main():
@@ -146,7 +151,7 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
     p = sp.add_parser("ls", parents=[g], help="list memories with type, modified date and description"); p.add_argument("--type", help="feedback | project | reference | user"); p.add_argument("--grep", help="regex over name and description"); p.set_defaults(f=cmd_ls)
     p = sp.add_parser("show", parents=[g], help="print one memory file"); p.add_argument("name", help="frontmatter name or file stem"); p.set_defaults(f=cmd_show)
-    p = sp.add_parser("grep", parents=[g], help="search memory bodies"); p.add_argument("regex"); p.set_defaults(f=cmd_grep)
+    p = sp.add_parser("grep", parents=[g], help="search memory bodies"); p.add_argument("regex", help="python regex, case-insensitive, over memory bodies"); p.set_defaults(f=cmd_grep)
     p = sp.add_parser("doctor", parents=[g], help="index/file mismatches and bad frontmatter"); p.add_argument("--fix-index", action="store_true", help="append an index line for every memory file that has none (off)"); p.set_defaults(f=cmd_doctor)
     p = sp.add_parser("append", parents=[g], help="append a dated addendum to one memory"); p.add_argument("name", help="frontmatter name or file stem"); p.add_argument("--body-file", required=True, help="file holding the addendum, or - for stdin (required)"); p.set_defaults(f=cmd_append)
     p = sp.add_parser("edit", parents=[g], help="replace one exact string and/or rewrite the description"); p.add_argument("name", help="frontmatter name or file stem")
@@ -159,6 +164,8 @@ def main():
     p.add_argument("--link", action="append", metavar="NAME", help="related memory name; repeatable; written as a final `Related: [[a]], [[b]]` line (none)")
     p.add_argument("--force", action="store_true", help="add even when a near-duplicate scores >= 0.5 (off)")
     p.set_defaults(f=cmd_add)
+    for name in ("add", "append", "edit", "doctor"):
+        sp.choices[name].add_argument("--dry-run", action="store_true", help="show what would be written, write nothing")
     a = ap.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()

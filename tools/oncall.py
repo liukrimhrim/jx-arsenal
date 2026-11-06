@@ -6,7 +6,7 @@
                                                 incidents of both providers newest first: id, ref, created, status, severity/urgency, title, owner, url
   jx oncall alerts [--status firing|resolved|all] [--since 24h] [--limit 100] [--source NAME] [--group]
                                                 incident.io alerts: created, status, source, title, dedup_key, resolved; --group = dedup_key_prefix, count, firing_now, example_id
-  jx oncall show <id>                           one incident, provider detected from the id: item/value, one `alert` row each, PagerDuty `event` rows (trigger/ack/resolve/escalate/notify)
+  jx oncall show <id|->                         one incident, provider detected from the id: item/value, one `alert` row each, PagerDuty `event` rows (trigger/ack/resolve/escalate/notify)
   jx oncall escalations [--since 24h] [--limit 50]   incident.io pages: created, status, priority, title, path, alerts, incidents, acked_by
   jx oncall users [QUERY]                       users of both providers (provider, name, email, role, id); QUERY = substring of name or email
   jx oncall routes                              incident.io alert routes and alert sources in one table: kind, name, enabled, type, id
@@ -63,6 +63,26 @@ def get(provider, path, params=None, all_pages=False):
             params["offset"] = d.get("offset", 0) + d.get("limit", len(d.get(page_key, [])))
     return {page_key: items} if page_key else {}
 
+def ids_arg(arg, col):
+    """One value, or every value from a TSV on stdin when arg is `-` (column `col` when the header has it, else the first column)."""
+    if arg != "-": return [arg]
+    lines = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    if not lines: sys.exit(f"nothing on stdin; expected a TSV with a `{col}` column")
+    head = lines[0].split("\t"); i = head.index(col) if col in head else 0
+    out = []
+    for l in (lines[1:] if col in head else lines):
+        v = l.split("\t")[i].strip()
+        if v and v not in out: out.append(v)
+    if not out: sys.exit(f"no `{col}` values on stdin")
+    return out
+
+def each(a, attr, col, fn, fix=lambda v: v):
+    vals = ids_arg(getattr(a, attr), col)
+    for i, v in enumerate(vals):
+        if len(vals) > 1: print(("" if i == 0 else "\n") + f"=== {v}"); sys.stdout.flush()
+        setattr(a, attr, fix(v)); fn(a)
+STDIN_HELP = "or - to read ids from a TSV on stdin (column `{}`, else the first column)"
+
 def tsv(rows, header):
     esc = lambda v: str(v).replace("\t", " ").replace("\n", "\\n") if v is not None else ""
     print("\t".join(header))
@@ -74,9 +94,11 @@ def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 def parse_ts(s): return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 def ts(s): return iso(parse_ts(s)) if s else ""  # PagerDuty sub-resources carry a local offset; everything is printed as UTC
 def since(s):
-    m = re.fullmatch(r"(\d+)([mhd])", s or "")
-    if not m: sys.exit(f"bad duration {s!r}; use 30m, 6h, 7d")
-    return datetime.now(timezone.utc) - timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]: int(m.group(1))})
+    """30m, 6h, 7d, 2w: that long ago, in UTC. Anything else is parsed as an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    try: dt = datetime.fromisoformat((s or "").replace("Z", "+00:00")); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
 def clip(s, n): s = s or ""; return s if len(s) <= n else s[:n - 1] + "…"
 def enough(limit, floor):
     """Stop predicate for get(): past the row limit, or the newest-first page has crossed the --since floor."""
@@ -190,7 +212,7 @@ def show_incidentio(a, id):
 def cmd_show(a):
     if pd_id(a.id): show_pagerduty(a, a.id)
     elif re.fullmatch(r"01[A-Z0-9]{24}", a.id): show_incidentio(a, a.id)
-    else: sys.exit(f"{a.id!r} is neither a PagerDuty id (12–14 uppercase alphanumerics) nor an incident.io id (26-char ULID); `jx oncall incidents` lists ids")
+    else: sys.exit(f"{a.id!r} is neither a PagerDuty id (12–14 uppercase alphanumerics) nor an incident.io id (26-char ULID)\n→ `jx oncall incidents` lists ids")
 
 def cmd_escalations(a):
     floor = since(a.since)
@@ -253,14 +275,14 @@ def main():
     p.add_argument("--status", choices=["firing", "resolved", "all"], default="all", help="(all)"); p.add_argument("--since", default="24h", help="created in this window (24h)")
     p.add_argument("--limit", type=int, default=100, help="rows (100)"); p.add_argument("--source", help="alert source name, case-insensitive substring; `jx oncall routes` lists them")
     p.add_argument("--group", action="store_true", help="dedup_key_prefix, count, firing_now, example_id over the whole window"); p.set_defaults(f=cmd_alerts)
-    p = sp.add_parser("show", parents=[g], help="one incident of either provider: item/value, then its alerts and timeline"); p.add_argument("id", help="PagerDuty or incident.io incident id; `jx oncall incidents` lists them"); p.set_defaults(f=cmd_show)
+    p = sp.add_parser("show", parents=[g], help="one incident of either provider: item/value, then its alerts and timeline"); p.add_argument("id", help="PagerDuty or incident.io incident id (`jx oncall incidents` lists them), " + STDIN_HELP.format("id")); p.set_defaults(f=lambda a: each(a, "id", "id", cmd_show))
     p = sp.add_parser("escalations", parents=[g], help="incident.io escalations (pages) newest first with path, counts and who acked")
     p.add_argument("--since", default="24h", help="created in this window (24h)"); p.add_argument("--limit", type=int, default=50, help="rows (50)"); p.set_defaults(f=cmd_escalations)
     p = sp.add_parser("users", parents=[g], help="users of both providers: name, email, role, id"); p.add_argument("query", nargs="?", help="case-insensitive substring of name or email (all users)"); p.set_defaults(f=cmd_users)
     sp.add_parser("routes", parents=[g], help="incident.io alert routes (enabled) and alert sources (type), one table with a kind column").set_defaults(f=cmd_routes)
     p = sp.add_parser("reconcile", parents=[g], help="do the providers agree: alert and incident counts per provider in one window, with how many are still firing/open")
     p.add_argument("--since", default="24h", help="created in this window (24h)"); p.set_defaults(f=cmd_reconcile)
-    p = sp.add_parser("api", parents=[g], help="one GET against a provider, raw JSON; --all follows pagination"); p.add_argument("provider", choices=["incidentio", "pagerduty"]); p.add_argument("path", help="e.g. /v2/alerts or /incidents")
+    p = sp.add_parser("api", parents=[g], help="one GET against a provider, raw JSON; --all follows pagination"); p.add_argument("provider", choices=["incidentio", "pagerduty"], help="which API to call"); p.add_argument("path", help="e.g. /v2/alerts or /incidents")
     p.add_argument("--param", action="append", default=[], metavar="k=v", help="query parameter, repeatable"); p.add_argument("--all", action="store_true", help="follow pagination and merge the list"); p.set_defaults(f=cmd_api)
     sp.add_parser("doctor", parents=[g], help="token source and a 1-item read per provider").set_defaults(f=cmd_doctor)
     a = ap.parse_args(); a.f(a)

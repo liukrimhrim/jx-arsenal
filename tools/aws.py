@@ -44,9 +44,11 @@ def aws(args, a, ok=(0,)):
     return json.loads(p.stdout) if p.stdout.strip() else {}
 
 def since(s):
-    m = re.fullmatch(r"(\d+)([mhd])", s or "")
-    if m: return datetime.now(timezone.utc) - timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]: int(m.group(1))})
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    """30m, 6h, 7d, 2w: that long ago, in UTC. Anything else is parsed as an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    try: dt = datetime.fromisoformat((s or "").replace("Z", "+00:00")); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
 
 def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 def utc(s):  # normalise any aws timestamp string to Z form; a naive string (Logs Insights) is already UTC, never local
@@ -192,7 +194,7 @@ def main():
     ap = argparse.ArgumentParser(prog="jx aws", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
     g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
     sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
-    sp.add_parser("whoami", parents=[g], help="account, role ARN, and SSO token validity; exit 1 when the token is expired").set_defaults(f=cmd_whoami)
+    sp.add_parser("whoami", parents=[g], aliases=["doctor"], help="account, role ARN, and SSO token validity; exit 1 when the token is expired").set_defaults(f=cmd_whoami)
     p = sp.add_parser("cw", parents=[g], help="CloudWatch datapoints, or the metric/dimension list of a namespace when no metric is given")
     p.add_argument("namespace", help="e.g. AWS/RDS"); p.add_argument("metric", nargs="?", help="metric name; omit to list metrics and dimensions"); p.add_argument("--dim", action="append", default=[], metavar="K=V", help="dimension, repeatable; every dimension of the series is required")
     p.add_argument("--stat", default="Average,SampleCount", help="comma list of Average,Sum,Maximum,Minimum,SampleCount (Average,SampleCount)"); p.add_argument("--since", default="6h", help="window start: 30m, 6h, 7d or ISO (6h)"); p.add_argument("--period", type=int, default=300, help="seconds per datapoint (300)"); p.set_defaults(f=cmd_cw)

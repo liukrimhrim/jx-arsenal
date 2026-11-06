@@ -5,7 +5,7 @@
   jx modal apps [--state deployed|stopped|all]        apps with state, live task count, created (deployed)
   jx modal containers [APP] [--count] [--watch SECS] [--interval 5]
                                                        running containers; --count per app; --watch samples the count over time
-  jx modal logs <app|ap-ID|ta-ID> [--since 10m] [--tail N] [--grep REGEX] [-C 2] [--search TEXT] [--source S] [--for SECS]
+  jx modal logs <app|ap-ID|ta-ID|-> [--since 10m] [--tail N] [--grep REGEX] [-C 2] [--search TEXT] [--source S] [--for SECS]
                                                        past log lines with UTC timestamps; --for follows live for SECS seconds
   jx modal history <app>                               deploy history: version, when, who, commit
   jx modal cost [--for RANGE | --since 7d] [--daily | --hourly] [--top 15] [--tag NAMES]
@@ -29,9 +29,11 @@ def utc(s):
     return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def since(s):
-    m = re.fullmatch(r"(\d+)([mhd])", s or "")
-    if not m: sys.exit(f"bad duration {s!r}; use 30m, 6h, 7d")
-    return datetime.now(timezone.utc) - timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]: int(m.group(1))})
+    """30m, 6h, 7d, 2w: that long ago, in UTC. Anything else is parsed as an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    try: dt = datetime.fromisoformat((s or "").replace("Z", "+00:00")); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
 
 def modal(a, *args, parse=True, timeout=120):
     cmd = ["modal", *args] + (["--json"] if parse else [])
@@ -49,6 +51,26 @@ def modal(a, *args, parse=True, timeout=120):
                "→ `jx modal apps --state all` lists app names and ids; `jx modal containers` lists ta-* ids" if re.search(r"not found|no such|could not find|does not exist|No \w+ with (name|id) .* found", err, re.I) else ""
         sys.exit(err + (f"\n{hint}" if hint else ""))
     return json.loads(p.stdout) if parse and p.stdout.strip() else p.stdout
+
+def ids_arg(arg, col):
+    """One value, or every value from a TSV on stdin when arg is `-` (column `col` when the header has it, else the first column)."""
+    if arg != "-": return [arg]
+    lines = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    if not lines: sys.exit(f"nothing on stdin; expected a TSV with a `{col}` column")
+    head = lines[0].split("\t"); i = head.index(col) if col in head else 0
+    out = []
+    for l in (lines[1:] if col in head else lines):
+        v = l.split("\t")[i].strip()
+        if v and v not in out: out.append(v)
+    if not out: sys.exit(f"no `{col}` values on stdin")
+    return out
+
+def each(a, attr, col, fn, fix=lambda v: v):
+    vals = ids_arg(getattr(a, attr), col)
+    for i, v in enumerate(vals):
+        if len(vals) > 1: print(("" if i == 0 else "\n") + f"=== {v}"); sys.stdout.flush()
+        setattr(a, attr, fix(v)); fn(a)
+STDIN_HELP = "or - to read ids from a TSV on stdin (column `{}`, else the first column)"
 
 def tsv(rows, header):
     esc = lambda v: str(v).replace("\t", " ").replace("\n", "\\n") if v is not None else ""
@@ -159,16 +181,16 @@ def main(argv=None):
     p = sp.add_parser("apps", parents=[g], help="apps with state and live task count"); p.add_argument("--state", default="deployed", choices=["deployed", "stopped", "all"], help="(deployed)"); p.set_defaults(f=cmd_apps)
     p = sp.add_parser("containers", parents=[g], help="running containers, per-app counts, or the count sampled over time"); p.add_argument("app", nargs="?", help="app name or ap-ID (all apps)")
     p.add_argument("--count", action="store_true", help="containers per app"); p.add_argument("--watch", type=int, metavar="SECS", help="sample the per-app count for this many seconds (off)"); p.add_argument("--interval", type=int, default=5, help="seconds between samples (5)"); p.set_defaults(f=cmd_containers)
-    p = sp.add_parser("logs", parents=[g], help="log lines of an app or one container, UTC timestamps"); p.add_argument("target", help="app name, ap-ID, or ta-ID")
+    p = sp.add_parser("logs", parents=[g], help="log lines of an app or one container, UTC timestamps"); p.add_argument("target", help="app name, ap-ID or ta-ID, " + STDIN_HELP.format("container_id"))
     p.add_argument("--since", help="window start: 30m, 6h, 2d or ISO (10m, or unbounded when --tail is given)"); p.add_argument("--tail", type=int, help="only the last N lines (all in the window)"); p.add_argument("--grep", help="python regex, client-side, with context")
     p.add_argument("-C", type=int, default=2, help="context lines around each --grep hit (2)"); p.add_argument("--search", help="server-side text filter"); p.add_argument("--source", choices=["stdout", "stderr", "system"], help="only this stream (all)")
-    p.add_argument("--for", dest="for_", type=int, metavar="SECS", help="follow live for this many seconds instead of reading the past (off)"); p.set_defaults(f=cmd_logs)
+    p.add_argument("--for", dest="for_", type=int, metavar="SECS", help="follow live for this many seconds instead of reading the past (off)"); p.set_defaults(f=lambda a: each(a, "target", "container_id", cmd_logs))
     p = sp.add_parser("history", parents=[g], help="deploy history of an app"); p.add_argument("app", help="app name or ap-ID"); p.set_defaults(f=cmd_history)
     p = sp.add_parser("cost", parents=[g], help="spend per app, or per interval with --daily/--hourly"); x = p.add_mutually_exclusive_group()
     x.add_argument("--for", dest="for_", help="today, yesterday, this week, last week, this month, last month (this month)"); x.add_argument("--since", help="window start: 7d, 30d")
     p.add_argument("--daily", action="store_true", help="one row per app per day"); p.add_argument("--hourly", action="store_true", help="one row per app per hour"); p.add_argument("--top", type=int, default=15, help="largest N apps (15)"); p.add_argument("--tag", help="comma-separated tag names to include"); p.set_defaults(f=cmd_cost)
-    p = sp.add_parser("ls", parents=[g], help="environments, secrets or volumes"); p.add_argument("kind", choices=["envs", "secrets", "volumes"]); p.set_defaults(f=cmd_ls)
-    sp.add_parser("whoami", parents=[g], help="active profile and environments").set_defaults(f=cmd_whoami)
+    p = sp.add_parser("ls", parents=[g], help="environments, secrets or volumes"); p.add_argument("kind", choices=["envs", "secrets", "volumes"], help="what to list"); p.set_defaults(f=cmd_ls)
+    sp.add_parser("whoami", parents=[g], aliases=["doctor"], help="active profile and environments").set_defaults(f=cmd_whoami)
     a = ap.parse_args(argv); CMD = a.cmd; a.f(a)
 
 if __name__ == "__main__": main()

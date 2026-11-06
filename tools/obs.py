@@ -87,9 +87,12 @@ def loki(env, path, params):
     return d["data"]
 
 def since(s):
-    m = re.fullmatch(r"(\d+)([smhd])", s or "")
-    if not m: sys.exit(f"bad duration {s!r}; use 30m, 6h, 7d")
-    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    """Seconds back from now for 30m, 6h, 7d, 2w, or for an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+    try: t = dt.datetime.fromisoformat((s or "").replace("Z", "+00:00")); t = t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
+    return int((dt.datetime.now(dt.timezone.utc) - t).total_seconds())
 def window(s):
     now = dt.datetime.now(dt.timezone.utc).timestamp(); return now - since(s), now
 
