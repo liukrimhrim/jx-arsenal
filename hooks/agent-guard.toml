@@ -1,0 +1,15 @@
+# Merge these groups into the existing hooks arrays; do not replace other hooks.
+# Review/trust through Codex /hooks after installation. Never write trust hashes.
+[[hooks.PreToolUse]]
+matcher = '^(Agent|(?:collaboration\.)?(?:spawn_agent|followup_task|send_message))$'
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 /Users/jinxinliu/code/jx-arsenal/tools/agent.py hook"
+timeout = 2
+
+[[hooks.PostToolUse]]
+matcher = '^(Agent|(?:collaboration\.)?spawn_agent)$'
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "python3 /Users/jinxinliu/code/jx-arsenal/tools/agent.py hook"
+timeout = 2
