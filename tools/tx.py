@@ -20,9 +20,11 @@ def proj_dir(a):
     return d
 
 def since(s):
-    m = re.fullmatch(r"(\d+)([hdw])", s or "")
-    if not m: sys.exit(f"bad duration {s!r}; use 12h, 7d, 4w")
-    return datetime.now(timezone.utc) - timedelta(**{{"h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    """30m, 6h, 7d, 2w: that long ago, in UTC. Anything else is parsed as an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    try: dt = datetime.fromisoformat((s or "").replace("Z", "+00:00")); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
 
 def records(path):
     with open(path, errors="replace") as fh:
@@ -134,7 +136,7 @@ def cmd_cmds(a):
 
 def cmd_show(a):
     d = proj_dir(a); fs = glob.glob(os.path.join(d, a.session + "*.jsonl"))
-    if len(fs) != 1: sys.exit(f"{len(fs)} sessions match {a.session!r}" + (": " + ", ".join(sorted(os.path.basename(f)[:-6] for f in fs)) if fs else "; `jx tx sessions` lists them"))
+    if len(fs) != 1: sys.exit(f"{len(fs)} sessions match {a.session!r}" + (": " + ", ".join(sorted(os.path.basename(f)[:-6] for f in fs)) if fs else "\n→ `jx tx sessions` lists them"))
     rx = re.compile(a.grep, re.I) if a.grep else None; rows = []
     for r, role in messages(fs[0], a.role):
         txt = text_of(r, tools=a.tools).strip()

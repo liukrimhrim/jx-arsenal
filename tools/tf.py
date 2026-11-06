@@ -37,7 +37,8 @@ def init(root, upgrade=False):
 
 def fail(root, what, text):
     t = re.sub(r"\n\s*\n", "\n", text.strip())[-1500:]
-    hints = [(r"no default value|No value for required variable", "the root needs variables: pass --var k=v or --var-file; CI's values are in the workflow that plans this root"),
+    hints = [(r"chdir .*no such file or directory", "that root directory does not exist; `jx tf roots <dir>` lists roots (paths are relative to the cwd)"),
+             (r"no default value|No value for required variable", "the root needs variables: pass --var k=v or --var-file; CI's values are in the workflow that plans this root"),
              (r"Invalid value for variable", "a validation rule rejected the value; the message above says what is accepted"),
              (r"authentication_error|401|403|Unauthorized|invalid.*token|credentials", "a provider or the state backend rejected credentials: `jx tf doctor <root>` shows the backend profile; export the provider's token env var (see `terraform -chdir=<root> providers`)"),
              (r"Error acquiring the state lock", "state is locked (Atlantis or another plan): wait, or re-run without --lock"),

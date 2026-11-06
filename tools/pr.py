@@ -4,7 +4,7 @@
   jx pr threads <n> [--all] [--full]                  review threads (unresolved only unless --all)
   jx pr reply <n> <comment-id> --body-file F [--dry-run]   reply to a review comment, then re-read it to verify
   jx pr comment <n> --body-file F [--dry-run]         top-level PR comment, then re-read it to verify
-  jx pr commits <n> [--since ISO]                     commits + file diffstat pushed after the last review by someone else
+  jx pr commits <n> [--since ISO|7d]                   commits + file diffstat pushed after the last review by someone else
   jx pr triage <n> [--wait]                           check rollup, then `jx ci failed` for every failing run: one call, no glue
   jx pr ci <n> [--wait] [--failed]                    check rollup; --wait polls until settled; --failed emits run_id/job_id TSV for `jx ci failed -`
   jx pr doctor
@@ -105,6 +105,10 @@ def cmd_comment(args):
 def cmd_since(args):
     repo = repo_of(args)
     since = args.since
+    m = re.fullmatch(r"(\d+)([smhdw])", since or "")
+    if m:  # a duration becomes the ISO cut the GitHub timestamps are compared against
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})).strftime("%Y-%m-%dT%H:%M:%SZ")
     if not since:
         me = gh("api", "user", "-q", ".login").strip()
         reviews = api(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
@@ -197,7 +201,7 @@ def main():
         if name == "reply": p.add_argument("comment_id", type=int, help="root comment_id from `jx pr threads`")
         p.add_argument("--body-file", help="file holding the markdown body"); p.add_argument("--body", help="inline body"); p.add_argument("--dry-run", action="store_true", help="print endpoint and body, post nothing"); p.set_defaults(f=f)
     p = sp.add_parser("commits", parents=[g], help="commits and per-file diffstat pushed after the last review by someone else")
-    p.add_argument("n", type=int, help="PR number"); p.add_argument("--since", help="ISO timestamp; default is the last review submitted by someone other than you"); p.set_defaults(f=cmd_since)
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--since", help="ISO timestamp or 30m/6h/7d/2w; default is the last review submitted by someone other than you"); p.set_defaults(f=cmd_since)
     p = sp.add_parser("ci", parents=[g], help="check rollup sorted fail > pending > pass; exit 1 if anything failed")
     p.add_argument("n", type=int, help="PR number"); p.add_argument("--wait", action="store_true", help="poll until nothing is pending"); p.add_argument("--failed", action="store_true", help="print job_id/run_id of failed checks for `jx ci failed` / `jx ci logs`")
     p.add_argument("--interval", type=int, default=30, help="seconds between polls (30)"); p.add_argument("--timeout", type=int, default=2400, help="give up after this many seconds (2400)"); p.set_defaults(f=cmd_ci)

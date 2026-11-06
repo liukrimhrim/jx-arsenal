@@ -5,7 +5,7 @@
   jx k <env> images [DEPLOY] [-n NS] [--env-var NAME]  image per container of each deployment, plus one env var (default GIT_SHA)
   jx k <env> nodes [--pools]                        nodes with instance type, zone, pool, capacity type, age; --pools = nodeclaims by pool
   jx k <env> events [-n NS | -A] [--warn]           events newest first; --warn = Warning only
-  jx k <env> logs <deploy/NAME | pod/NAME> [-n NS] [--since 10m] [--grep PAT] [-C N] [--tail N]
+  jx k <env> logs <deploy/NAME | pod/NAME | -> [-n NS] [--since 10m] [--grep PAT] [-C N] [--tail N]
   jx k <env> rollout <deploy/NAME> [-n NS] [--timeout 300s]
   jx k <env> secret <NAME> <KEY> [-n NS]            one key, base64-decoded, to stdout
   jx k <env> doctor
@@ -68,6 +68,26 @@ def age(ts):
     if not ts: return ""
     s = int((datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds())
     return f"{s//86400}d" if s >= 86400 else f"{s//3600}h" if s >= 3600 else f"{s//60}m" if s >= 60 else f"{s}s"
+
+def ids_arg(arg, col):
+    """One value, or every value from a TSV on stdin when arg is `-` (column `col` when the header has it, else the first column)."""
+    if arg != "-": return [arg]
+    lines = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    if not lines: sys.exit(f"nothing on stdin; expected a TSV with a `{col}` column")
+    head = lines[0].split("\t"); i = head.index(col) if col in head else 0
+    out = []
+    for l in (lines[1:] if col in head else lines):
+        v = l.split("\t")[i].strip()
+        if v and v not in out: out.append(v)
+    if not out: sys.exit(f"no `{col}` values on stdin")
+    return out
+
+def each(a, attr, col, fn, fix=lambda v: v):
+    vals = ids_arg(getattr(a, attr), col)
+    for i, v in enumerate(vals):
+        if len(vals) > 1: print(("" if i == 0 else "\n") + f"=== {v}"); sys.stdout.flush()
+        setattr(a, attr, fix(v)); fn(a)
+STDIN_HELP = "or - to read ids from a TSV on stdin (column `{}`, else the first column)"
 
 def tsv(rows, header):
     esc = lambda v: str(v).replace("\t", " ").replace("\n", "\\n") if v is not None else ""
@@ -199,8 +219,8 @@ def main(argv=None):
     p.add_argument("--env-var", default="GIT_SHA", help="container env var to show next to the image (GIT_SHA)"); p.add_argument("--full", action="store_true", help="full image refs with registry and digest"); p.set_defaults(f=cmd_img)
     p = sp.add_parser("nodes", parents=[g], help="nodes with instance type, zone, pool, capacity type, kubelet version, age"); p.add_argument("--pools", action="store_true", help="Karpenter nodeclaims grouped by nodepool instead of nodes"); p.set_defaults(f=cmd_nodes)
     p = sp.add_parser("events", parents=[g], help="events newest first"); ns(p); p.add_argument("--warn", action="store_true", help="Warning events only"); p.add_argument("--limit", type=int, default=50, help="max events (50)"); p.set_defaults(f=cmd_events)
-    p = sp.add_parser("logs", parents=[g], help="container logs of a workload, optionally grepped with context"); p.add_argument("target", help="deploy/NAME, pod/NAME, sts/NAME, ds/NAME"); ns(p, False)
-    p.add_argument("--since", default="10m", help="kubectl duration (10m)"); p.add_argument("--grep", help="python regex; prints hits with context"); p.add_argument("-C", type=int, default=2, help="context lines around each hit (2)"); p.add_argument("--tail", type=int, default=2000, help="lines fetched per container before grep (2000)"); p.set_defaults(f=cmd_logs)
+    p = sp.add_parser("logs", parents=[g], help="container logs of a workload, optionally grepped with context"); p.add_argument("target", help="deploy/NAME, pod/NAME, sts/NAME, ds/NAME, " + STDIN_HELP.format("pod") + "; a bare name is a pod"); ns(p, False)
+    p.add_argument("--since", default="10m", help="kubectl duration (10m)"); p.add_argument("--grep", help="python regex; prints hits with context"); p.add_argument("-C", type=int, default=2, help="context lines around each hit (2)"); p.add_argument("--tail", type=int, default=2000, help="lines fetched per container before grep (2000)"); p.set_defaults(f=lambda a: each(a, "target", "pod", cmd_logs, fix=lambda v: v if "/" in v else f"pod/{v}"))
     p = sp.add_parser("rollout", parents=[g], help="rollout status of a workload"); p.add_argument("target", help="deploy/NAME, sts/NAME, ds/NAME"); ns(p, False); p.add_argument("--timeout", default="300s", help="kubectl duration to wait (300s)"); p.set_defaults(f=cmd_rollout)
     p = sp.add_parser("secret", parents=[g], help="one key of a secret, base64-decoded, to stdout"); p.add_argument("name", help="secret name"); p.add_argument("key", help="data key; a wrong key lists the real ones"); ns(p, False); p.set_defaults(f=cmd_secret)
     sp.add_parser("doctor", parents=[g], help="context exists, server reachable, version, can-i get pods").set_defaults(f=cmd_doctor)

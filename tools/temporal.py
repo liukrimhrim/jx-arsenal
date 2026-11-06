@@ -6,8 +6,8 @@ JSON output, prints TSV. --json for the raw payload.
                                               how many executions match; --by-status groups by ExecutionStatus
   jx temporal <env> list  [--type T] [--status S] [--queue Q] [--since 6h] [--query Q] [--limit 50]
                                               one row per execution: id, run, type, status, queue, start, close, duration
-  jx temporal <env> describe <workflow-id> [--run R]  item/value: status, times, innermost failure + type, one pending_activity row per in-flight activity
-  jx temporal <env> history  <workflow-id> [--run R] [--failures] [--grep REGEX] [--limit 200]
+  jx temporal <env> describe <workflow-id|-> [--run R]  item/value: status, times, innermost failure + type, one pending_activity row per in-flight activity
+  jx temporal <env> history  <workflow-id|-> [--run R] [--failures] [--grep REGEX] [--limit 200]
                                               one row per event: event_id, time, type, detail (activity, failure message, child id, marker)
   jx temporal <env> failed [--type T] [--queue Q] [--since 6h] [--limit 20] [--group]
                                               Failed/TimedOut/Terminated executions with the innermost failure; --group = failure, count, example_id
@@ -77,9 +77,11 @@ def tcli(addr, env, *args):
     return json.loads(p.stdout) if p.stdout.strip() else {}
 
 def since(s):
-    m = re.fullmatch(r"(\d+)([mhd])", s or "")
-    if not m: sys.exit(f"bad duration {s!r}; use 30m, 6h, 7d")
-    return datetime.now(timezone.utc) - timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]: int(m.group(1))})
+    """30m, 6h, 7d, 2w: that long ago, in UTC. Anything else is parsed as an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    try: dt = datetime.fromisoformat((s or "").replace("Z", "+00:00")); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
 
 def build_query(a):
     parts = []
@@ -89,6 +91,26 @@ def build_query(a):
     if a.since: parts.append(f'StartTime >= "{since(a.since).strftime("%Y-%m-%dT%H:%M:%SZ")}"')
     if a.query: parts.append(f"({a.query})")
     return " AND ".join(parts)
+
+def ids_arg(arg, col):
+    """One value, or every value from a TSV on stdin when arg is `-` (column `col` when the header has it, else the first column)."""
+    if arg != "-": return [arg]
+    lines = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    if not lines: sys.exit(f"nothing on stdin; expected a TSV with a `{col}` column")
+    head = lines[0].split("\t"); i = head.index(col) if col in head else 0
+    out = []
+    for l in (lines[1:] if col in head else lines):
+        v = l.split("\t")[i].strip()
+        if v and v not in out: out.append(v)
+    if not out: sys.exit(f"no `{col}` values on stdin")
+    return out
+
+def each(a, attr, col, fn, fix=lambda v: v):
+    vals = ids_arg(getattr(a, attr), col)
+    for i, v in enumerate(vals):
+        if len(vals) > 1: print(("" if i == 0 else "\n") + f"=== {v}"); sys.stdout.flush()
+        setattr(a, attr, fix(v)); fn(a)
+STDIN_HELP = "or - to read ids from a TSV on stdin (column `{}`, else the first column)"
 
 def tsv(rows, header):
     esc = lambda v: str(v).replace("\t", " ").replace("\n", "\\n") if v is not None else ""
@@ -243,7 +265,7 @@ def main():
     p = sp.add_parser("count", parents=[g], help="count executions matching the filters"); add_filters(p); p.add_argument("--by-status", action="store_true", help="group counts by ExecutionStatus"); p.set_defaults(f=cmd_count)
     p = sp.add_parser("list", parents=[g], help="executions matching the filters, newest first"); add_filters(p); p.add_argument("--limit", type=int, default=50, help="max executions (50)"); p.set_defaults(f=cmd_list)
     p = sp.add_parser("describe", parents=[g], help="one execution: status, times, innermost failure, pending activities"); p.add_argument("workflow_id", help="workflow id; `jx temporal <env> list` shows ids"); p.add_argument("--run", help="run id (latest run)"); p.set_defaults(f=cmd_describe)
-    p = sp.add_parser("history", parents=[g], help="event history of one execution, one row per event"); p.add_argument("workflow_id", help="workflow id"); p.add_argument("--run", help="run id (latest run)")
+    p = sp.add_parser("history", parents=[g], help="event history of one execution, one row per event"); p.add_argument("workflow_id", help="workflow id, " + STDIN_HELP.format("workflow_id")); p.add_argument("--run", help="run id (latest run)")
     p.add_argument("--failures", action="store_true", help="only *FAILED, *TIMED_OUT, *TERMINATED, *CANCELED events plus the first"); p.add_argument("--grep", help="python regex on type and detail"); p.add_argument("--limit", type=int, default=200, help="last N events after filtering (200)"); p.set_defaults(f=cmd_history)
     p = sp.add_parser("failed", parents=[g], help="Failed/TimedOut/Terminated executions with their innermost failure; --group counts by failure"); add_filters(p, status=False)
     p.add_argument("--limit", type=int, default=20, help="max executions described, one CLI call each (20)"); p.add_argument("--group", action="store_true", help="rows failure, count, example_id instead of one row per execution"); p.set_defaults(f=cmd_failed)
@@ -251,6 +273,7 @@ def main():
     p.add_argument("--type", choices=["workflow", "activity", "both"], default="both", help="poller kind (both)"); p.set_defaults(f=cmd_queue)
     p = sp.add_parser("schedules", parents=[g], help="schedules with paused flag, next/last run and last result; one id gives spec and recent actions"); p.add_argument("schedule_id", nargs="?", help="one schedule for its spec and last 5 actions (all schedules)"); p.set_defaults(f=cmd_schedules)
     sp.add_parser("doctor", parents=[g], help="port-forward works, server version, namespace retention").set_defaults(f=cmd_doctor)
+    sp.choices["describe"].set_defaults(f=lambda a: each(a, "workflow_id", "workflow_id", cmd_describe)); sp.choices["history"].set_defaults(f=lambda a: each(a, "workflow_id", "workflow_id", cmd_history))
     a = ap.parse_args()
     if a.env != "all": a.f(a); return
     first = True

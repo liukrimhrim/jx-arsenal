@@ -8,7 +8,7 @@
                                                               stage only the named paths and commit; refuses main/master, a switched
                                                               branch, no paths, unknown or unchanged paths; warns about foreign changes
   jx git wt <name> [--base origin/main] [--dir DIR] [--copy PATH ...]   worktree on a fresh branch under $TMPDIR; --copy moves edits over
-  jx git wt ls | jx git wt rm <dir>                           list worktrees / remove one (never the main worktree)
+  jx git wt ls | jx git wt rm <dir> [--force]                         list worktrees / remove one (never the main worktree)
   jx git export <ref> <dir>                                   `git archive` into DIR plus DIR/.git-sha with the full sha
   jx git touching <path ...> [-R owner/name]                  open PRs whose files overlap these paths (gh; exit 2 when unavailable)
   jx git doctor                                               toplevel, branch, upstream, ahead/behind, uncommitted, shallow, origin, main age
@@ -173,7 +173,9 @@ def cmd_wt(a):
         wts = worktrees(); target = os.path.realpath(a.rm_dir)
         if target == os.path.realpath(wts[0]["dir"]): sys.exit(f"{a.rm_dir} is the main worktree; only worktrees added with `jx git wt <name>` can be removed")
         if target not in {os.path.realpath(w["dir"]) for w in wts}: sys.exit(f"{a.rm_dir} is not a worktree of this repo (`jx git wt ls`)")
-        git("worktree", "remove", "--force", a.rm_dir); git("worktree", "prune"); print(f"removed {a.rm_dir}"); return
+        dirty = [l for l in subprocess.run(["git", "-C", target, "status", "--porcelain"], text=True, capture_output=True).stdout.splitlines() if l.strip()]
+        if dirty and not a.force: sys.exit(f"{a.rm_dir} has {len(dirty)} uncommitted changes ({' '.join(l[3:] for l in dirty[:5])}{' ...' if len(dirty) > 5 else ''}); commit them, `jx git wt <name> --copy` them elsewhere, or pass --force to discard")
+        git("worktree", "remove", "--force", a.rm_dir); git("worktree", "prune"); print(f"removed {a.rm_dir}" + (f" (discarded {len(dirty)} changes)" if dirty else "")); return
     top = toplevel(); copies = rel_paths(a.copy, top)
     base = resolve(a.base, None); sha = git("rev-parse", base).strip()
     d = os.path.normpath(os.path.abspath(a.dir or os.path.join(tempfile.gettempdir(), "jx-wt-" + a.name.replace("/", "-"))))
@@ -239,6 +241,7 @@ def main():
     p.add_argument("--push", action="store_true", help="push -u origin <branch> afterwards and verify the remote tip (off)"); p.add_argument("--no-sign", action="store_true", help="commit with commit.gpgsign=false (repo config)")
     p.add_argument("--trailer", action="append", default=[], metavar="LINE", help="trailer line appended after a blank line, repeatable (none)"); p.set_defaults(f=cmd_commit)
     p = sp.add_parser("wt", parents=[g], help="add a worktree on a fresh branch outside the checkout; `ls` and `rm <dir>` manage them")
+    p.add_argument("--force", action="store_true", help="rm: discard uncommitted changes in that worktree (refused otherwise)")
     p.add_argument("name", help="branch to create (reset if it exists), or `ls` / `rm`"); p.add_argument("rm_dir", nargs="?", metavar="DIR", help="rm only: the worktree directory to remove")
     p.add_argument("--base", default="origin/main", help="start point, fetched first when origin/<b> (origin/main)"); p.add_argument("--dir", help="where to put the worktree ($TMPDIR/jx-wt-<name>)")
     p.add_argument("--copy", action="append", default=[], metavar="PATH", help="copy this path from the current tree into the worktree, repeatable; directories recurse (none)"); p.set_defaults(f=cmd_wt)
