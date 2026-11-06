@@ -126,6 +126,8 @@ def cmd_since(args):
 def checks(args):
     p = subprocess.run(["gh", "pr", "checks", str(args.n), "--json", "name,state,bucket,link,workflow"] + (["-R", args.repo] if args.repo else []),
                        text=True, capture_output=True)
+    if p.returncode == 1 and not p.stdout.strip() and p.stderr.strip().startswith("no checks reported on the "):
+        return []
     if p.returncode not in (0, 1, 8) or not p.stdout.strip():  # 8 = pending, 1 = failing
         sys.stderr.write(p.stderr); sys.exit(2)
     return json.loads(p.stdout)

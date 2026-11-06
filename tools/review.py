@@ -5,9 +5,9 @@
   jx review <pr> --check-only [--previous SNAPSHOT] [--local] [--out DIR]
   jx review --selftest
 
-Run inside the repo checkout. Read-only towards git and GitHub: it fetches, but
-creates no refs, branches, worktrees or comments. Writes a bundle to DIR
-(default $TMPDIR/review-prep/pr<N>, reused on the next run for the same PR):
+Run inside the repo checkout. Reads GitHub and fetches Git objects; never switches
+branches, creates worktrees or posts comments. Writes a bundle to DIR
+(default $TMPDIR/review-prep/OWNER/REPO/pr<N>, reused for the same PR):
 
   tree/             snapshot of the whole repo at the PR head (--paths limits it)
   diff-code.patch   merge-base..head without evidence, lock and checksum files
@@ -156,9 +156,17 @@ def main():
     out = Path(args.out or Path(tempfile.gettempdir()) / "review-prep" / owner / name / f"pr{args.pr}").resolve()
     if out.exists() and any(out.iterdir()) and not (out / MARKER).exists():
         die(f"{out} exists, is not empty and was not made by review-prep; pass another --out")
+    source = {"url": pr["url"], "head": head, "base": pr["baseRefOid"], "merge": pr.get("mergeCommit")}
+    old_source = json.loads((out / "snapshot.json").read_text()).get("source") if (out / "snapshot.json").exists() else None
     snapshot = {"captured_at": datetime.now(timezone.utc).isoformat(), "pr": pr,
-                "feedback": feedback(owner, name, args.pr)}
+                "feedback": feedback(owner, name, args.pr), "source": old_source}
     snapshot["changes"] = changes(json.loads(Path(args.previous).read_text()), snapshot) if args.previous else None
+    if old_source != source:
+        if (out / "tree").exists():
+            shutil.rmtree(out / "tree")
+        for artifact in ("diff-code.patch", "diffstat.txt", "delta-code.patch", "range-diff.txt"):
+            (out / artifact).unlink(missing_ok=True)
+        snapshot["source"] = None
     if args.local:
         local_head = git("rev-parse", "HEAD")
         remote = git("ls-remote", "origin", f"refs/heads/{pr['headRefName']}").split("\t")[0]
@@ -258,6 +266,8 @@ def main():
     subprocess.run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout, check=True)
     if archive.wait() != 0:
         die("git archive failed")
+    snapshot["source"] = source
+    (out / "snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n")
     print(f"tree/ holds: {' '.join(args.paths) or 'whole repo at head'}")
 
     dirs = {""} | {"docs"}

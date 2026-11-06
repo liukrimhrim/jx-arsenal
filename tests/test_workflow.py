@@ -54,7 +54,11 @@ class WorkflowTests(unittest.TestCase):
 f = json.load(open(os.environ['FIXTURE']))
 a = sys.argv[1:]
 if a[:2] == ['pr', 'view']: value = f['pr']
-elif a[:2] == ['pr', 'checks']: value = f['checks']
+elif a[:2] == ['pr', 'checks']:
+    if f.get('check_error'):
+        print(f['check_error'], file=sys.stderr)
+        raise SystemExit(1)
+    value = f['checks']
 elif a[:2] == ['api', 'graphql']:
     value = {'data': {'repository': {'pullRequest': {'createdAt': '2026-11-01T00:00:00Z', 'lastEditedAt': None}}}}
 elif a[0] == 'api':
@@ -139,6 +143,38 @@ print(json.dumps(value))
         self.git('commit', '-qam', 'unpublished change')
         unpublished, _ = self.snapshot('unpublished', '--local')
         self.assertEqual(unpublished.returncode, 1, unpublished.stderr)
+
+    def test_new_head_invalidates_old_source_bundle(self):
+        out = self.base / 'reused'
+        first = self.cli('review', 7, '--out', out)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual((out / 'tree/change.py').read_text(), 'answer = 42\n')
+        (self.repo / 'change.py').write_text('answer = 43\n')
+        self.git('commit', '-qam', 'next head')
+        self.git('push', '-q', 'origin', 'topic', 'HEAD:refs/pull/7/head')
+        self.fixture['pr']['headRefOid'] = self.git('rev-parse', 'HEAD')
+        self.save_fixture()
+        check = self.cli('review', 7, '--check-only', '--out', out)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertFalse((out / 'tree').exists())
+        self.assertFalse((out / 'diff-code.patch').exists())
+        self.assertIsNone(json.loads((out / 'snapshot.json').read_text())['source'])
+        same = self.cli('review', 7, '--since', self.fixture['pr']['headRefOid'], '--out', out)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertFalse((out / 'tree').exists())
+        rebuilt = self.cli('review', 7, '--out', out)
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+        self.assertEqual((out / 'tree/change.py').read_text(), 'answer = 43\n')
+
+    def test_real_cli_no_checks_response_and_auth_failure(self):
+        for command in ('ci', 'triage'):
+            for error, expected in [("no checks reported on the 'topic' branch", 8),
+                                     ('HTTP 401: Bad credentials', 2)]:
+                with self.subTest(command=command, error=error):
+                    self.fixture['check_error'] = error
+                    self.save_fixture()
+                    result = self.cli('pr', command, 7)
+                    self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_ci_never_succeeds_when_unsettled_cancelled_or_missing(self):
         for command in ('ci', 'triage'):

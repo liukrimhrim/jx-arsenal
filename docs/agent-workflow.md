@@ -28,6 +28,10 @@ unchanged, not that findings were fixed or CI passed. Exit 0 means a snapshot wa
 or inputs changed. Read `feedback.md` for actual findings. The snapshot is an observation,
 not an atomic transaction or authorization.
 
+When an output directory is reused for different source inputs, old source/patch files
+are removed even in `--check-only` mode. The snapshot's `source` field is null until a
+full export succeeds; new metadata cannot silently label an old source tree.
+
 `--local` is for the author's checkout: local HEAD and the remote branch must match
 the PR head, with a clean checkout. Mismatch/dirty state exits 1. It never pushes.
 
