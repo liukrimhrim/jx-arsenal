@@ -186,6 +186,7 @@ def main():
     print(f"url: {pr['url']}")
     print(f"state: {pr['state']}{' draft' if pr['isDraft'] else ''}  mergeable: {pr['mergeable']} {pr['mergeStateStatus']}")
     print(f"head: {head}  ({pr['headRefName']})")
+    print(f"Review-Key: github.com/{owner}/{name}@{head}")
     checks = pr.get("statusCheckRollup") or []
     print("checks: " + ("; ".join(f"{c.get('workflowName') or c.get('context')}/{c.get('name', '')}="
                                    f"{c.get('conclusion') or c.get('status') or c.get('state')}" for c in checks) or "none"))

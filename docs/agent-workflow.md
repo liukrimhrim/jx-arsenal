@@ -3,6 +3,47 @@
 These commands replace repeated collection and reporting. They do not choose tests,
 judge a review finding, approve an external action, or certify GPU behavior.
 
+## Delegation guard (Codex)
+
+`tools/agent.py hook` runs only on agent launches and handoffs. It rewrites
+`spawn_agent` to `fork_turns: "none"` in the same call, preserving other arguments.
+It denies messages over 16 KiB (UTF-8 bytes, not a token count); use file pointers
+for long evidence. It does not limit system instructions, skills, subsequent file
+reads, or the agent's accumulated context. Normal successful calls produce no
+extra model-visible prose.
+
+A reviewer/auditor role or task name, a prompt starting with Review/Audit, or an
+explicit key activates review deduplication. Include exactly one line copied from
+`jx review`, or from `jx agent key` for a clean committed local checkout:
+
+```text
+Review-Key: github.com/OWNER/REPO@FULL_COMMIT_SHA
+```
+
+One new reviewer may launch for that repository/commit per parent chat, regardless
+of its name or prompt wording. A changed commit permits another review. A necessary
+repeat of the same commit (new comments, failed reviewer, distinct required review)
+uses `jx agent release SESSION KEY --reason 'specific new evidence'`; the denial
+prints the exact session/key. Choosing that exception still requires judgment.
+The key must name the actual target. This does not recognize disguised review
+tasks, compare semantic scope, deduplicate across chats/clients, or prevent someone
+from asking an existing agent to review again. Followups are size-limited only.
+
+SQLite reserves launches atomically, including concurrent calls. PostToolUse
+records the successful agent ID/name or releases a failed spawn. If the client
+never delivers PostToolUse, a pending reservation expires after two minutes;
+successful records last for the chat. State is in
+`${XDG_STATE_HOME:-~/.local/state}/jx/agents.sqlite3`. No network, model, transcript
+scan, or background process is used. This is an efficiency guard, not a security
+boundary: hooks must be enabled/trusted, and client hook failures can fail open.
+
+Install the entries in `hooks/agent-guard.toml` into the existing `[hooks]` arrays
+in `~/.codex/config.toml`, adjusting the absolute script path if needed. Preserve
+existing entries. Run `/hooks` in Codex CLI and review/trust both new definitions.
+Do not edit trust hashes. Codex skips untrusted definitions; installation alone
+does not establish that enforcement is active. See the official
+[hook contract and trust flow](https://learn.chatgpt.com/docs/hooks).
+
 ## Review intake and rechecks
 
 ```sh

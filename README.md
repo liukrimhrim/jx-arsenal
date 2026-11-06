@@ -12,6 +12,7 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | `jx pr` | review threads with comment ids, verified reply/comment, commits since last review, check rollup, `triage` = checks + failed logs in one call |
 | `jx review` | exact-head source/diff preparation, paginated feedback snapshots, edited/deleted comment detection, local/published identity check |
 | `jx check` | run a chosen command once, retain full logs and Git state, derive counts from JUnit, print a compact reusable receipt |
+| `jx agent` | Codex delegation hook: fresh contexts, bounded handoffs, one reviewer per repository/commit per chat |
 | `jx ci` | Actions runs, jobs by attempt, failed-job log triage, dispatch with `--dry-run`, wait; ids chain via stdin `-` |
 | `jx k` | kubectl by environment: pods with waiting reasons, images + GIT_SHA, Karpenter node census, events, logs, rollout, secrets; `jx k all` fans out |
 | `jx aws` | SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS; every timestamp UTC |
