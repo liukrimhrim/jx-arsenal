@@ -70,7 +70,7 @@ def changes(before, after):
         "base": before["pr"]["baseRefOid"] != after["pr"]["baseRefOid"],
         "description": any(before["pr"].get(k) != after["pr"].get(k) for k in ("title", "body")),
         "state": before["pr"]["state"] != after["pr"]["state"],
-        "exclusions": before.get("exclude", []) != after["exclude"],
+        "exclusions": before.get("exclude") != after["exclude"],
         "feedback": {"added": sorted(new.keys() - old.keys()), "removed": sorted(old.keys() - new.keys()),
                      "edited": sorted(k for k in old.keys() & new.keys() if old[k] != new[k])},
     }

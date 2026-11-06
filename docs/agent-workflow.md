@@ -66,6 +66,7 @@ and grouped diffstat; inspect them separately when relevant. Configuration comes
 from the local checkout, not the PR branch. The effective list is printed and saved
 in `snapshot.json`; invalid JSON or an invalid config shape fails instead of silently
 using defaults. Missing config means no exclusions. `--paths` limits the source export.
+Legacy snapshots without recorded exclusions count as changed on their first recheck.
 
 For a status/feedback recheck, skip the source export:
 

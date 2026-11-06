@@ -218,6 +218,16 @@ print(json.dumps(value))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse((self.base / 'invalid-config').exists())
 
+    def test_legacy_snapshot_without_exclusion_provenance_requires_review(self):
+        first, before = self.snapshot('legacy')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        legacy = json.loads(before.read_text())
+        del legacy['exclude']  # Older clients applied implicit exclusions without recording them.
+        before.write_text(json.dumps(legacy))
+        changed, after = self.snapshot('after-upgrade', '--previous', before)
+        self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+        self.assertTrue(json.loads(after.read_text())['changes']['exclusions'])
+
     def test_config_is_root_relative_and_output_is_caller_relative(self):
         self.add_review_files()
         self.set_review_exclusions(['build-output/**'])
