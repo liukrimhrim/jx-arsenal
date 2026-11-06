@@ -10,6 +10,8 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | Tool | What it covers |
 |---|---|
 | `jx pr` | review threads with comment ids, verified reply/comment, commits since last review, check rollup, `triage` = checks + failed logs in one call |
+| `jx review` | exact-head source/diff preparation, paginated feedback snapshots, edited/deleted comment detection, local/published identity check |
+| `jx check` | run a chosen command once, retain full logs and Git state, derive counts from JUnit, print a compact reusable receipt |
 | `jx ci` | Actions runs, jobs by attempt, failed-job log triage, dispatch with `--dry-run`, wait; ids chain via stdin `-` |
 | `jx k` | kubectl by environment: pods with waiting reasons, images + GIT_SHA, Karpenter node census, events, logs, rollout, secrets; `jx k all` fans out |
 | `jx aws` | SSO-aware whoami, CloudWatch metrics/alarms, ECR tags, Cost Explorer, Logs Insights, EKS; every timestamp UTC |
@@ -21,6 +23,8 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | `jx mem`, `jx tx` | the agent's own bookkeeping: memory files of the current project (list, show, grep, add with a duplicate check, append, edit, doctor for index drift) and session transcripts (sessions, grep, the Bash commands run, one session's messages) |
 
 `jx ls` prints every command on one line each. Dispatcher: `bin/jx`; tools: `tools/*.py`; notes: `docs/`.
+
+Review/check examples and exit codes: [agent workflow commands](docs/agent-workflow.md).
 
 ## Install
 

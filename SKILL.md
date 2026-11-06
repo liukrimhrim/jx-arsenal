@@ -6,7 +6,8 @@ description: One CLI for the loops agents otherwise glue by hand — PR review t
 # jx
 
 `jx ls` lists every command on one line each. `jx <tool> --help` is the deep reference for one tool.
-`jx doctor` checks gh auth, aws identity and SSO token, kubectl contexts. Tools: `pr`, `ci`, `k`, `aws`, `obs`, `tf`, `git`, `temporal`, `oncall`, `mem`, `tx`.
+`jx doctor` checks gh auth, aws identity and SSO token, kubectl contexts. Tools include `review`
+for review snapshots and `check` for command receipts; examples: `docs/agent-workflow.md`.
 
 Output is TSV with a header row; `--json` in any position gives the raw payload. Error messages
 name the command that lists valid ids. Anything that posts or triggers has `--dry-run`.
@@ -14,6 +15,9 @@ name the command that lists valid ids. Anything that posts or triggers has `--dr
 ## Keep the model out of the loop
 
 ```bash
+jx review 1234 --out /tmp/pr1234              # source/diff + full feedback, including inline comments
+jx review 1234 --check-only --previous /tmp/pr1234/snapshot.json --out /tmp/pr1234-next
+jx check run --junit junit.xml -- python -m pytest tests --junitxml '{out}/junit.xml'
 jx pr triage 1234 --wait                       # wait for checks, then failed-job log lines for every failing run
 jx pr ci 1234 --failed | jx ci failed -        # same thing as two composable steps; `-` reads run_id from stdin
 jx ci runs deploy.yml --branch main --limit 3 | jx ci wait -

@@ -9,7 +9,7 @@
   jx pr ci <n> [--wait] [--failed]                    check rollup; --wait polls until settled; --failed emits run_id/job_id TSV for `jx ci failed -`
   jx pr doctor
 
-Exit codes: 0 ok · 1 something failed (a failing check, a verify mismatch) · 2 usage/auth.
+Exit codes: 0 ok · 1 failed/cancelled · 2 usage/auth · 8 CI pending or no checks reported.
 Posting (reply/comment) is an outward action: run with --dry-run first, post only with approval.
 """
 import argparse, json, re, subprocess, sys, time, signal
@@ -126,9 +126,16 @@ def cmd_since(args):
 def checks(args):
     p = subprocess.run(["gh", "pr", "checks", str(args.n), "--json", "name,state,bucket,link,workflow"] + (["-R", args.repo] if args.repo else []),
                        text=True, capture_output=True)
+    if p.returncode == 1 and not p.stdout.strip() and p.stderr.strip().startswith("no checks reported on the "):
+        return []
     if p.returncode not in (0, 1, 8) or not p.stdout.strip():  # 8 = pending, 1 = failing
         sys.stderr.write(p.stderr); sys.exit(2)
     return json.loads(p.stdout)
+
+def check_exit(rows):
+    if any(c['bucket'] in ('fail', 'cancel') for c in rows): return 1
+    if not rows or any(c['bucket'] not in ('pass', 'skipping') for c in rows): return 8
+    return 0
 
 def cmd_ci(args):
     deadline = time.time() + args.timeout
@@ -148,8 +155,8 @@ def cmd_ci(args):
     else:
         rows.sort(key=lambda c: ({"fail": 0, "pending": 1, "cancel": 2, "pass": 3, "skipping": 4}.get(c["bucket"], 5), c["name"]))
         emit(rows, ["bucket", "state", "name", "workflow", "link"], args)
-    sys.stderr.write(f"{len(failed)} failed, {sum(c['bucket']=='pass' for c in rows)} passed, {sum(c['bucket']=='pending' for c in rows)} pending\n")
-    sys.exit(1 if failed else 0)
+    sys.stderr.write(f"{len(failed)} failed, {sum(c['bucket']=='pass' for c in rows)} passed, {sum(c['bucket']=='pending' for c in rows)} pending, {sum(c['bucket']=='cancel' for c in rows)} cancelled\n")
+    sys.exit(check_exit(rows))
 
 def cmd_triage(args):
     """pr ci --failed, then ci failed per run, in-process: the failing log lines arrive in one call."""
@@ -160,8 +167,8 @@ def cmd_triage(args):
         if not (args.wait and pending) or time.time() > deadline: break
         sys.stderr.write(f"{len(pending)} pending… sleep {args.interval}s\n"); time.sleep(args.interval)
     failed = [c for c in rows if c["bucket"] == "fail"]
-    print(f"{len(failed)} failed, {sum(c['bucket']=='pass' for c in rows)} passed, {len(pending)} pending")
-    if not failed: return
+    print(f"{len(failed)} failed, {sum(c['bucket']=='pass' for c in rows)} passed, {len(pending)} pending, {sum(c['bucket']=='cancel' for c in rows)} cancelled")
+    if not failed: sys.exit(check_exit(rows))
     for c in failed: print(f"FAIL\t{c['name']}\t{c['link']}")
     runs = list(dict.fromkeys(m.group(1) for c in failed for m in [re.search(r"/actions/runs/(\d+)", c["link"] or "")] if m))
     ci = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci.py")
