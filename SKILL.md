@@ -1,6 +1,6 @@
 ---
 name: jx
-description: One CLI for the loops agents otherwise glue by hand — PR review threads and verified replies, CI run/job/log triage, kubectl across environments, AWS CloudWatch/ECR/cost/Logs Insights/EKS, Prometheus (AMP) and Loki queries by environment, Terraform check/plan/diff per root, git reads at a ref and a guarded commit, Temporal counts/failures/history by environment, incident.io and PagerDuty on-call, incidents and alerts, the agent's own memory files and session transcripts, Modal apps/containers/logs/cost. Run `jx ls` once to see every command. Use it instead of gh/kubectl/aws piped into python heredocs; chain with stdin `-`, and prefer `--wait` and `jx pr triage` so one call finishes a loop.
+description: One CLI for the loops agents otherwise glue by hand — PR state, comments, review threads and verified replies or edits, CI run/job/log triage and per-shard timings, pinned venvs reused by path, kubectl across environments, AWS CloudWatch/ECR/cost/Logs Insights/EKS, Prometheus (AMP) and Loki queries by environment, Terraform check/plan/diff per root, git reads at a ref and a guarded commit, Temporal counts/failures/history by environment, incident.io and PagerDuty on-call, incidents and alerts, the agent's own memory files and session transcripts, Modal apps/containers/logs/cost. Run `jx ls` once to see every command. Use it instead of gh/kubectl/aws piped into python heredocs; chain with stdin `-`, and prefer `--wait` and `jx pr triage` so one call finishes a loop.
 ---
 
 # jx
@@ -20,6 +20,11 @@ jx review 1234 --check-only --previous /tmp/pr1234/snapshot.json --out /tmp/pr12
 jx check run --junit junit.xml -- python -m pytest tests --junitxml '{out}/junit.xml'
 jx pr triage 1234 --wait                       # wait for checks, then failed-job log lines for every failing run
 jx pr ci 1234 --failed | jx ci failed -        # same thing as two composable steps; `-` reads run_id from stdin
+jx pr show 84 85 86                            # state, head sha, mergeable, check counts, unresolved threads: one row per PR
+jx pr comments 1234 --since mine               # what was posted after your last comment or review
+jx pr edit 1234 --body-file body.md --dry-run  # body diff first; without --dry-run it edits, then re-reads to verify
+jx ci runs ci.yml --branch b --limit 3 | jx ci timings -   # per-job seconds, pytest counts, slowest step, across runs
+PY=$(jx venv path -p 3.12 -r requirements.txt pytest==9.2.0)   # pinned interpreter by path, built once, shared by sessions
 jx ci runs deploy.yml --branch main --limit 3 | jx ci wait -
 jx ci dispatch deploy.yml -f env=stage --wait  # one call: trigger, resolve run id, block until done
 K_ENVS=dev,stage,prod jx k all images my-api -n default   # what is running where, one table
@@ -40,6 +45,6 @@ needed and `-` usually is enough. Intermediate results never need to pass throug
 
 ## Rules
 
-- Reach for `jx` before writing `gh api ... | python3 -c`, `kubectl -o json | python3`, `aws ... | jq`, a SigV4 `curl` against AMP, `terraform show -json | python3`, a `git fetch && git show origin/main:` chain, a `kubectl port-forward` plus `temporal ... | python3`, or a `curl -H Authorization` against incident.io or PagerDuty.
-- `jx pr reply` / `jx pr comment` post to GitHub: `--dry-run` first, post only with the user's approval of that exact text.
-- Deeper notes per tool: `docs/gh.md`, `docs/k.md`, `docs/aws.md` in this directory.
+- Reach for `jx` before writing `gh pr view --json ... --jq`, `gh api .../actions/jobs/...`, a scratchpad `uv venv && uv pip install`, `gh api ... | python3 -c`, `kubectl -o json | python3`, `aws ... | jq`, a SigV4 `curl` against AMP, `terraform show -json | python3`, a `git fetch && git show origin/main:` chain, a `kubectl port-forward` plus `temporal ... | python3`, or a `curl -H Authorization` against incident.io or PagerDuty.
+- `jx pr reply` / `jx pr comment` / `jx pr edit` write to GitHub: `--dry-run` first, post only with the user's approval of that exact text.
+- Deeper notes per tool: `docs/gh.md`, `docs/k.md`, `docs/aws.md`, `docs/venv.md` in this directory.
