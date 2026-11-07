@@ -31,6 +31,8 @@ K_ENVS=dev,stage,prod jx k all images my-api -n default   # what is running wher
 jx obs all fresh 'up{job="my-api"}' --max-age 120      # are samples landing in every environment, exit 1 if not
 jx tf roots infra --changed | jx tf check -              # fmt + validate only the roots this branch touched
 jx git cat path/to/file --ref origin/main                 # read main's copy without touching the checkout
+jx git cat docs/PLAN.md --outline                          # headings with line numbers; then --section 'name' or --lines A:B
+jx git cat src/a.py --grep 'def main' -C 3                  # numbered matches instead of `git show REF:path | grep -n`
 jx git commit -m 'msg' --expect-branch my-branch -- path   # refuses main, a switched branch, or unnamed paths
 jx temporal prod failed --since 6h --group                 # what is failing and how often, one forward, no heredoc
 jx oncall who                                              # who is paged first on every schedule, both providers
@@ -47,4 +49,5 @@ needed and `-` usually is enough. Intermediate results never need to pass throug
 
 - Reach for `jx` before writing `gh pr view --json ... --jq`, `gh api .../actions/jobs/...`, a scratchpad `uv venv && uv pip install`, `gh api ... | python3 -c`, `kubectl -o json | python3`, `aws ... | jq`, a SigV4 `curl` against AMP, `terraform show -json | python3`, a `git fetch && git show origin/main:` chain, a `kubectl port-forward` plus `temporal ... | python3`, or a `curl -H Authorization` against incident.io or PagerDuty.
 - `jx pr reply` / `jx pr comment` / `jx pr edit` write to GitHub: `--dry-run` first, post only with the user's approval of that exact text.
+- A `jx hint` in context after a Bash call names the jx command for the loop just run; prefer it next time.
 - Deeper notes per tool: `docs/gh.md`, `docs/k.md`, `docs/aws.md`, `docs/venv.md` in this directory.

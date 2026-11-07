@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""jx agent — local Codex delegation hook; no model, network or transcript reads.
+"""jx agent — local agent hooks; no model, network or transcript reads.
 
   jx agent key                         print a Review-Key for committed HEAD
   jx agent release SESSION KEY --reason TEXT   permit a deliberate repeat review
   jx agent hook                        read one Codex hook event from stdin
+  jx agent hint                        read one Claude Code PreToolUse Bash event; name the jx command for a raw gh/git/uv loop
+
+`hint` adds context only, never a permission decision, at most once per pattern per session, and
+exits 0 on any error so a broken hint can never block a command.
 
 Fresh contexts and a 16 KiB handoff limit apply to new agents. The handoff limit
 also applies to followup_task/send_message. Named reviewers/auditors must carry
@@ -111,6 +115,37 @@ def hook(event):
     return None
 
 
+# (key, pattern over the Bash command, the jx command that replaces it). Evidence: `jx tx cmds` over agent sessions.
+HINTS = [
+    ("pr-view", r"\bgh pr (?:view|list)\b.*--json", "`jx pr show <n> [n ...]` prints state, head sha, mergeable, check counts and unresolved threads, one row per PR (`--files`, `--body`)"),
+    ("gh-jobs", r"\bgh api\b.*actions/(?:jobs|runs)/|\bgh run view\b", "`jx ci timings <run|->` (per-job seconds, pytest counts, slowest step), `jx ci jobs <run>`, `jx ci logs <job> --grep PAT`, `jx ci failed <run>`"),
+    ("issue-comments", r"\bgh api\b.*issues/\d+/comments", "`jx pr comments <n> --since mine|push|6h` reads them; `jx pr comment <n> --body-file F --dry-run` posts and re-reads"),
+    ("pr-edit", r"\bgh pr edit\b", "`jx pr edit <n> --body-file F --dry-run` diffs the body; without --dry-run it edits and re-reads to verify"),
+    ("pr-checks", r"\bgh pr checks\b", "`jx pr ci <n> --wait`, or `jx pr triage <n> --wait` for checks plus failed-job log lines in one call"),
+    ("git-show-path", r"\bgit show\s+(?!-)[^\s:|;&]+:[^\s|;&]", "`jx git cat <path> --ref <ref>` with `--grep PAT -C N -i`, `--lines A:B`, `--outline` or `--section HEADING` slices the file without sed or grep"),
+    ("venv", r"\buv venv\b|\bpython3? -m venv\b", "`PY=$(jx venv path -p 3.12 -r reqs.txt PKG==V)` builds once and reuses the venv by path across sessions"),
+    ("transcripts", r"\.claude/projects/\S*\.jsonl|\.claude/projects.*\bglob\b", "`jx tx sessions|grep|cmds|show` read this project's session transcripts"),
+    ("kubectl-json", r"\bkubectl\b.*-o\s*json.*\|\s*(?:python|jq)", "`jx k <env> pods|images|nodes|events|logs` answer without -o json"),
+    ("aws-pipe", r"\baws\s+[a-z].*\|\s*(?:jq|python)", "`jx aws whoami|cw|alarms|ecr-tags|cost|logs-query|eks`"),
+    ("tf-show", r"\bterraform show\s+-json", "`jx tf diff <planfile>` prints the attribute-level diff of a saved plan"),
+]
+
+def hint(event):
+    """additionalContext naming the jx equivalent of a raw command, once per pattern per session; None otherwise."""
+    if event.get("hook_event_name") != "PreToolUse" or event.get("tool_name") != "Bash": return None
+    command = (event.get("tool_input") or {}).get("command") or ""
+    hits = [(k, h) for k, rx, h in HINTS if re.search(rx, command, re.S)]
+    if not hits: return None
+    # ponytail: one small file per session under $TMPDIR; the OS clears it, nothing else needs it
+    seen_file = Path(os.environ.get("TMPDIR", "/tmp")) / f"jx-hints-{re.sub(r'[^A-Za-z0-9_-]', '', str(event.get('session_id', 'none')))}"
+    seen = set(seen_file.read_text().split()) if seen_file.exists() else set()
+    new = [(k, h) for k, h in hits if k not in seen]
+    if not new: return None
+    with open(seen_file, "a") as f: f.write("".join(k + "\n" for k, _ in new))
+    text = "jx hint (shown once per session): " + " | ".join(h for _, h in new) + ". `jx ls` lists every command."
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+
+
 def local_key():
     def git(*args):
         return subprocess.check_output(["git", *args], text=True, stderr=subprocess.PIPE).strip()
@@ -136,11 +171,19 @@ def main():
     sub = ap.add_subparsers(dest="action", required=True)
     sub.add_parser("key")
     sub.add_parser("hook")
+    sub.add_parser("hint")
     release = sub.add_parser("release")
     release.add_argument("session")
     release.add_argument("key")
     release.add_argument("--reason", required=True)
     args = ap.parse_args()
+    if args.action == "hint":
+        try:
+            result = hint(json.load(sys.stdin))
+            if result: print(json.dumps(result))
+        except Exception:  # a hint must never block or error a command; say nothing instead
+            pass
+        return 0
     try:
         if args.action == "key":
             local_key()

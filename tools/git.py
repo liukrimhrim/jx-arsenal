@@ -2,6 +2,7 @@
 """jx git — git idioms agents re-derive every session. TSV by default, --json for raw where it applies.
 
   jx git cat <path> [path ...] [--ref origin/main | --pr N]   file contents at a ref, after a quiet fetch; no checkout
+      [--grep PAT [-C N] [-i] | --lines A:B | --outline | --section HEADING]   numbered slices instead of the whole file
   jx git ls <path> [--ref origin/main | --pr N] [-r]          names under a path at a ref
   jx git since [BASE] [--log | --files | --stat]              fetch, merge-base, then commits / files / diffstat vs BASE (origin/main)
   jx git commit -m MSG | -F FILE | -F - [--expect-branch B] [--strict] [--push] [--no-sign] [--trailer LINE ...] -- <path ...>
@@ -48,11 +49,56 @@ def emit(rows, header, a, raw=None):
     if a.json: print(json.dumps(raw if raw is not None else rows, indent=1))
     else: tsv(rows, header)
 
+HEADING = re.compile(r"^(#{1,6})\s+(.*)")
+DEF = re.compile(r"^\s*(?:async\s+def|def|class)\s")
+
+def headings(lines):
+    """(index, level, title) of each markdown heading outside ``` / ~~~ fences."""
+    out, fence = [], False
+    for i, l in enumerate(lines):
+        if l.lstrip().startswith(("```", "~~~")): fence = not fence; continue
+        m = None if fence else HEADING.match(l)
+        if m: out.append((i, len(m.group(1)), m.group(2).strip()))
+    return out
+
+def ranges(lines, spans, sep=True):
+    """[lo, hi) spans as `N: line`, with `--` between spans that do not touch unless sep is False."""
+    out, last = [], -1
+    for lo, hi in sorted(spans):
+        lo = max(lo, last + 1)
+        if lo >= hi: continue
+        if sep and out and lo > last + 1: out.append("--")
+        out += [f"{k + 1}: {lines[k]}" for k in range(lo, hi)]; last = hi - 1
+    return out
+
+def slices(lines, path, a):
+    """The numbered lines a slicing flag asks for, or None when no slice matched."""
+    if a.lines:
+        lo, _, hi = a.lines.replace(",", ":").partition(":")
+        try: lo, hi = int(lo or 1), int(hi or len(lines)) if _ else int(lo)
+        except ValueError: sys.exit(f"bad --lines {a.lines!r}; use A:B, A: or :B (1-based, inclusive)")
+        return ranges(lines, [(lo - 1, min(hi, len(lines)))]) or None
+    if a.grep:
+        rx = re.compile(a.grep, re.I if a.i else 0)
+        return ranges(lines, [(i - a.C, i + a.C + 1) for i, l in enumerate(lines) if rx.search(l)]) or None
+    if a.outline:
+        idx = [i for i, l in enumerate(lines) if DEF.match(l)] if path.endswith(".py") else [i for i, _, _ in headings(lines)]
+        return ranges(lines, [(i, i + 1) for i in idx], sep=False) or None
+    hs, rx = headings(lines), re.compile(a.section, re.I)
+    spans = [(i, next((j for j, lv, _ in hs[k + 1:] if lv <= level), len(lines))) for k, (i, level, t) in enumerate(hs) if rx.search(t)]
+    return ranges(lines, spans) or None
+
 def cmd_cat(a):
-    ref = resolve(a.ref, a.pr)
+    ref = resolve(a.ref, a.pr); sliced = a.lines or a.grep or a.outline or a.section; missed = []
     for i, p in enumerate(a.path):
         if len(a.path) > 1: print(f"{'' if i == 0 else chr(10)}=== {ref}:{p}")
-        sys.stdout.write(git("show", f"{ref}:{p.strip('/')}"))
+        text = git("show", f"{ref}:{p.strip('/')}")
+        if not sliced: sys.stdout.write(text); continue
+        out = slices(text.splitlines(), p, a)
+        if out is None: missed.append(p)
+        else: print("\n".join(out))
+    if missed:  # grep's convention: exit 1 when nothing matched
+        sys.exit(f"no match in {', '.join(missed)}" + ("; `jx git cat <path> --outline` lists the headings" if a.section else ""))
 
 def cmd_ls(a):
     ref = resolve(a.ref, a.pr)
@@ -230,7 +276,11 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
     def ref(p):
         p.add_argument("--ref", default="origin/main", help="ref to read from (origin/main); origin/<b> is fetched first"); p.add_argument("--pr", type=int, metavar="N", help="read the head of pull request N instead")
-    p = sp.add_parser("cat", parents=[g], help="file contents at a ref, no checkout"); p.add_argument("path", nargs="+", help="repo-relative path(s)"); ref(p); p.set_defaults(f=cmd_cat)
+    p = sp.add_parser("cat", parents=[g], help="file contents at a ref, no checkout; slicing flags print numbered lines")
+    p.add_argument("path", nargs="+", help="repo-relative path(s)"); ref(p)
+    x = p.add_mutually_exclusive_group(); x.add_argument("--grep", metavar="PAT", help="python regex; matching lines with -C context"); x.add_argument("--lines", metavar="A:B", help="1-based inclusive range; A: or :B leave an end open")
+    x.add_argument("--outline", action="store_true", help="markdown headings, or def/class lines for .py, with line numbers"); x.add_argument("--section", metavar="HEADING", help="regex on markdown heading text; prints each match through to the next heading of its level or higher")
+    p.add_argument("-C", type=int, default=0, help="context lines around --grep hits (0)"); p.add_argument("-i", action="store_true", help="case-insensitive --grep"); p.set_defaults(f=cmd_cat)
     p = sp.add_parser("ls", parents=[g], help="names under a path at a ref"); p.add_argument("path", nargs="?", default="", help="repo-relative directory (root)"); ref(p); p.add_argument("-r", action="store_true", help="recursive"); p.set_defaults(f=cmd_ls)
     p = sp.add_parser("since", parents=[g], help="how this branch differs from BASE: ahead/behind, files, or the log"); p.add_argument("base", nargs="?", default="origin/main", help="base ref (origin/main)")
     x = p.add_mutually_exclusive_group(); x.add_argument("--log", action="store_true", help="commits since the merge-base"); x.add_argument("--files", action="store_true", help="changed paths with status"); x.add_argument("--stat", action="store_true", help="diffstat"); p.set_defaults(f=cmd_since)

@@ -9,6 +9,10 @@ names live in the tool; refs and paths come from the caller.
 ```bash
 jx git cat path/to/file                      # origin/main's copy, after a quiet fetch
 jx git cat a.py b.py --pr 1234               # the PR head's copies; fetches pull/1234/head into pr/1234
+jx git cat docs/PLAN.md --outline            # markdown headings (def/class lines for .py) with line numbers
+jx git cat docs/PLAN.md --section 'speed'    # one section, through to the next heading of its level or higher
+jx git cat src/a.py --grep 'def main|add_argument' -C 2 -i   # numbered matches with context, `--` between hunks
+jx git cat src/a.py --lines 150:185          # a numbered range; A: or :B leave an end open
 jx git ls infra/environments -r --ref origin/release
 jx git since                                 # branch, base, merge-base, ahead/behind, files changed, uncommitted
 jx git since --log | --files | --stat
