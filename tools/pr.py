@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """jx pr — PR lifecycle lever for agents. TSV by default, --json for the raw payload.
 
+  jx pr show <n> [n ...] [--body] [--files]           one row per PR: state, head sha, mergeable, size, check counts, unresolved threads
+  jx pr comments <n> [--since ISO|7d|push|mine] [--full]   top-level comments and review verdicts, oldest first
   jx pr threads <n> [--all] [--full]                  review threads (unresolved only unless --all)
   jx pr reply <n> <comment-id> --body-file F [--dry-run]   reply to a review comment, then re-read it to verify
   jx pr comment <n> --body-file F [--dry-run]         top-level PR comment, then re-read it to verify
+  jx pr edit <n> [--title T] [--body-file F] [--dry-run]   change title/body, then re-read to verify; --dry-run diffs the body
   jx pr commits <n> [--since ISO|7d]                   commits + file diffstat pushed after the last review by someone else
   jx pr triage <n> [--wait]                           check rollup, then `jx ci failed` for every failing run: one call, no glue
   jx pr ci <n> [--wait] [--failed]                    check rollup; --wait polls until settled; --failed emits run_id/job_id TSV for `jx ci failed -`
   jx pr doctor
 
 Exit codes: 0 ok · 1 failed/cancelled · 2 usage/auth · 8 CI pending or no checks reported.
-Posting (reply/comment) is an outward action: run with --dry-run first, post only with approval.
+Posting (reply/comment/edit) is an outward action: run with --dry-run first, post only with approval.
 """
-import argparse, json, re, subprocess, sys, time, signal
+import argparse, difflib, json, re, subprocess, sys, time, signal
+from collections import Counter
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 CMD = ""  # current subcommand, for error hints
 NOT_FOUND = {
@@ -23,6 +27,7 @@ NOT_FOUND = {
     "commits": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
     "ci": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
     "comment": "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo.",
+    **dict.fromkeys(("show", "comments", "edit"), "PR not found in this repo. `gh pr list --state all --search <text>` finds the number; pass -R owner/name for another repo."),
     "reply": "PR or comment id not found. `jx pr threads <n>` prints the root comment_id of each thread; reply to that id, not the thread id.",
 }
 
@@ -56,10 +61,85 @@ def emit(rows, header, args):
     if args.json: print(json.dumps(rows, indent=1))
     else: tsv(rows, header)
 
+def since(s):
+    """30m, 6h, 7d, 2w: that long ago, in UTC. Anything else is parsed as an ISO time (a naive one is UTC)."""
+    m = re.fullmatch(r"(\d+)([smhdw])", s or "")
+    if m: return datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})
+    try: dt = datetime.fromisoformat((s or "").replace("Z", "+00:00")); return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError: sys.exit(f"bad time {s!r}; use 30m, 6h, 7d, 2w, or an ISO time like 2026-01-31T00:00:00Z")
+
+def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def read_body(args):
     if args.body_file: return open(args.body_file).read()
     if args.body is not None: return args.body
     sys.exit("need --body-file or --body")
+
+# ---------------- show ----------------
+SHOW = "number,state,isDraft,title,author,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,mergeCommit,reviewDecision,additions,deletions,changedFiles,comments,statusCheckRollup,updatedAt,url"
+# ponytail: first 100 review threads only; `jx pr threads` pages through all of them
+TQ = """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
+ reviewThreads(first:100){nodes{isResolved}} commits(last:1){totalCount nodes{commit{committedDate}}}}}}"""
+
+def bucket(c):
+    """One statusCheckRollup entry: a CheckRun has status + conclusion, a StatusContext has state."""
+    if c.get("__typename") == "CheckRun" and c.get("status") != "COMPLETED": return "pending"
+    s = (c.get("conclusion") or c.get("state") or "").upper()
+    if s in ("SUCCESS", "NEUTRAL"): return "pass"
+    if s == "SKIPPED": return "skip"
+    if s in ("", "PENDING", "EXPECTED"): return "pending"
+    return "fail"
+
+def threads_and_head(repo, n):
+    o, r = repo.split("/")
+    return json.loads(gh("api", "graphql", "-F", f"o={o}", "-F", f"r={r}", "-F", f"n={n}", "-f", f"query={TQ}"))["data"]["repository"]["pullRequest"]
+
+def login(u): return (u or {}).get("login", "ghost")  # a deleted account comes back as null
+
+def cmd_show(args):
+    repo = repo_of(args); rows = []
+    for n in args.n:
+        d = json.loads(gh("pr", "view", str(n), "-R", repo, "--json", SHOW + ",body" * args.body + ",files" * args.files))
+        g = threads_and_head(repo, n)
+        b = Counter(map(bucket, d["statusCheckRollup"])); last = g["commits"]["nodes"]
+        row = {"n": n, "state": "DRAFT" if d["isDraft"] and d["state"] == "OPEN" else d["state"], "title": d["title"], "author": login(d["author"]),
+               "head": d["headRefName"], "head_sha": d["headRefOid"][:10], "base": d["baseRefName"], "mergeable": d["mergeable"], "merge_state": d["mergeStateStatus"],
+               "merge_commit": (d["mergeCommit"] or {}).get("oid", "")[:10], "review": d["reviewDecision"], "+": d["additions"], "-": d["deletions"], "files": d["changedFiles"],
+               "commits": g["commits"]["totalCount"], "checks": " ".join(f"{k}={b[k]}" for k in ("fail", "pending", "pass", "skip") if b[k]) or "none",
+               "unresolved": sum(not t["isResolved"] for t in g["reviewThreads"]["nodes"]), "comments": len(d["comments"]),
+               "last_commit": last[0]["commit"]["committedDate"] if last else "", "updated": d["updatedAt"], "url": d["url"]}
+        if args.body: row["body"] = d["body"]
+        if args.files: row["file_list"] = [{"+": f["additions"], "-": f["deletions"], "path": f["path"]} for f in d["files"]]
+        rows.append(row)
+    if args.json: print(json.dumps(rows, indent=1)); return
+    tsv(rows, ["n", "state", "head", "head_sha", "base", "mergeable", "merge_state", "merge_commit", "review", "checks", "unresolved", "comments", "commits", "+", "-", "files", "last_commit", "author", "title", "url"])
+    for row in rows:
+        if args.files: print(f"\n=== #{row['n']} files"); tsv(row["file_list"], ["+", "-", "path"])
+        if args.body: print(f"\n=== #{row['n']} {row['title']}\n{row['body']}")
+
+# ---------------- comments ----------------
+def cmd_comments(args):
+    repo = repo_of(args)
+    # ponytail: first 100 comments and 100 reviews; page with `gh api --paginate` if a PR ever has more
+    rows = [{"kind": "comment", "id": c["id"], "author": login(c["user"]), "created": c["created_at"], "state": "", "body": c["body"], "url": c["html_url"]}
+            for c in api(f"/repos/{repo}/issues/{args.n}/comments?per_page=100")]
+    rows += [{"kind": "review", "id": v["id"], "author": login(v["user"]), "created": v["submitted_at"], "state": v["state"], "body": v["body"], "url": v["html_url"]}
+             for v in api(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
+             if v.get("submitted_at") and (v["body"] or v["state"] != "COMMENTED")]  # a bodiless COMMENTED review only wraps inline comments: `jx pr threads`
+    rows.sort(key=lambda x: x["created"])
+    if args.since:
+        if args.since == "push":
+            cut = threads_and_head(repo, args.n)["commits"]["nodes"][0]["commit"]["committedDate"]
+        elif args.since == "mine":
+            me = gh("api", "user", "-q", ".login").strip(); mine = [x["created"] for x in rows if x["author"] == me]
+            if not mine: sys.exit(f"no comment or review by {me} on #{args.n}; pass --since ISO or 7d")
+            cut = mine[-1]
+        else: cut = iso(since(args.since))
+        rows = [x for x in rows if x["created"] > cut]; sys.stderr.write(f"after {cut}: ")
+    if not args.full:
+        for x in rows: x["body"] = (x["body"] or "")[:200]
+    emit(rows, ["kind", "id", "author", "created", "state", "body", "url"], args)
+    sys.stderr.write(f"{len(rows)} comments/reviews\n")
 
 # ---------------- threads ----------------
 Q = """query($o:String!,$r:String!,$n:Int!,$after:String){repository(owner:$o,name:$r){pullRequest(number:$n){
@@ -102,29 +182,45 @@ def cmd_comment(args):
     posted = api(f"/repos/{repo}/issues/{args.n}/comments", "POST", {"body": body})
     verify(api(f"/repos/{repo}/issues/comments/{posted['id']}"), body, args)
 
+def cmd_edit(args):
+    repo = repo_of(args); want = {}
+    if args.title is not None: want["title"] = args.title
+    if args.body_file or args.body is not None: want["body"] = read_body(args)
+    if not want: sys.exit("nothing to change; pass --title and/or --body-file")
+    cur = api(f"/repos/{repo}/pulls/{args.n}")
+    if args.dry_run:
+        print(f"DRY RUN: PATCH /repos/{repo}/pulls/{args.n}")
+        if "title" in want: print(f"title: {cur['title']!r} -> {want['title']!r}")
+        if "body" in want:
+            # compared stripped, like the verify step: a trailing newline from `gh -q .body > F` is not a change
+            diff = "\n".join(difflib.unified_diff((cur["body"] or "").strip().splitlines(), want["body"].strip().splitlines(), "current body", "new body", lineterm=""))
+            print(diff or "body: unchanged")
+        return
+    api(f"/repos/{repo}/pulls/{args.n}", "PATCH", want)
+    got = api(f"/repos/{repo}/pulls/{args.n}")
+    ok = all((got.get(k) or "").strip() == v.strip() for k, v in want.items())
+    print(json.dumps({"url": got.get("html_url"), "changed": sorted(want), "verified": ok}))
+    if not ok: sys.exit(1)
+
 # ---------------- since ----------------
 def cmd_since(args):
     repo = repo_of(args)
-    since = args.since
-    m = re.fullmatch(r"(\d+)([smhdw])", since or "")
-    if m:  # a duration becomes the ISO cut the GitHub timestamps are compared against
-        from datetime import datetime, timedelta, timezone
-        since = (datetime.now(timezone.utc) - timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m.group(2)]: int(m.group(1))})).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if not since:
+    since_ = iso(since(args.since)) if args.since else None  # the ISO cut GitHub timestamps compare against as strings
+    if not since_:
         me = gh("api", "user", "-q", ".login").strip()
         reviews = api(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
         others = [r["submitted_at"] for r in reviews if r.get("submitted_at") and r["user"]["login"] != me]
         if not others: sys.exit("no review by someone else; pass --since ISO")
-        since = max(others)
+        since_ = max(others)
     commits = api(f"/repos/{repo}/pulls/{args.n}/commits?per_page=250")
-    new = [c for c in commits if c["commit"]["committer"]["date"] > since]
+    new = [c for c in commits if c["commit"]["committer"]["date"] > since_]
     rows = [{"sha": c["sha"][:10], "date": c["commit"]["committer"]["date"], "msg": c["commit"]["message"].splitlines()[0]} for c in new]
-    sys.stderr.write(f"since {since}: {len(new)} commits\n")
+    sys.stderr.write(f"since {since_}: {len(new)} commits\n")
     if not new: return
     base = new[0]["parents"][0]["sha"]; head = new[-1]["sha"]
     cmp_ = api(f"/repos/{repo}/compare/{base}...{head}")
     files = [{"status": f["status"], "+": f["additions"], "-": f["deletions"], "file": f["filename"]} for f in cmp_.get("files", [])]
-    if args.json: print(json.dumps({"since": since, "commits": rows, "files": files}, indent=1)); return
+    if args.json: print(json.dumps({"since": since_, "commits": rows, "files": files}, indent=1)); return
     tsv(rows, ["sha", "date", "msg"]); print(); tsv(files, ["status", "+", "-", "file"])
 
 # ---------------- ci ----------------
@@ -196,12 +292,21 @@ def main():
     ap = argparse.ArgumentParser(prog="jx pr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); add_globals(ap)
     g = argparse.ArgumentParser(add_help=False); add_globals(g, suppress=True)  # same flags accepted after the subcommand
     sp = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
+    p = sp.add_parser("show", parents=[g], help="one row per PR: state, head sha, mergeability, size, check counts, unresolved threads, comment count")
+    p.add_argument("n", type=int, nargs="+", help="PR number(s)"); p.add_argument("--body", action="store_true", help="print each PR body after the table")
+    p.add_argument("--files", action="store_true", help="print each PR's changed files with +/- after the table"); p.set_defaults(f=cmd_show)
+    p = sp.add_parser("comments", parents=[g], help="top-level comments and review verdicts (not inline threads), oldest first")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--since", help="ISO time, 30m/6h/7d/2w, `push` (after the head commit) or `mine` (after your last comment or review)")
+    p.add_argument("--full", action="store_true", help="full bodies instead of the first 200 chars"); p.set_defaults(f=cmd_comments)
     p = sp.add_parser("threads", parents=[g], help="review threads with comment ids; unresolved only unless --all")
     p.add_argument("n", type=int, help="PR number"); p.add_argument("--all", action="store_true", help="include resolved threads"); p.add_argument("--full", action="store_true", help="full comment bodies instead of the first 200 chars"); p.set_defaults(f=cmd_threads)
     for name, f, h in (("reply", cmd_reply, "reply to a review comment, then re-read it to verify"), ("comment", cmd_comment, "post a top-level PR comment, then re-read it to verify")):
         p = sp.add_parser(name, parents=[g], help=h); p.add_argument("n", type=int, help="PR number")
         if name == "reply": p.add_argument("comment_id", type=int, help="root comment_id from `jx pr threads`")
         p.add_argument("--body-file", help="file holding the markdown body"); p.add_argument("--body", help="inline body"); p.add_argument("--dry-run", action="store_true", help="print endpoint and body, post nothing"); p.set_defaults(f=f)
+    p = sp.add_parser("edit", parents=[g], help="change a PR's title and/or body, then re-read it to verify")
+    p.add_argument("n", type=int, help="PR number"); p.add_argument("--title", help="new title"); p.add_argument("--body-file", help="file holding the new markdown body"); p.add_argument("--body", help="inline new body")
+    p.add_argument("--dry-run", action="store_true", help="print the title change and a unified diff of the body; change nothing"); p.set_defaults(f=cmd_edit)
     p = sp.add_parser("commits", parents=[g], help="commits and per-file diffstat pushed after the last review by someone else")
     p.add_argument("n", type=int, help="PR number"); p.add_argument("--since", help="ISO timestamp or 30m/6h/7d/2w; default is the last review submitted by someone other than you"); p.set_defaults(f=cmd_since)
     p = sp.add_parser("ci", parents=[g], help="check rollup sorted fail > pending > pass; exit 1 if anything failed")

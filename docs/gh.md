@@ -5,6 +5,19 @@ Two stdlib-only Python CLIs over `gh`, personal tooling in `~/.claude/skills` (n
 `-R owner/name` to target another repo (default: the current checkout). Each has `doctor`.
 Run with `--help` for the full command list; the summary below is what to reach for.
 
+## PR state at a glance
+
+```bash
+jx pr show 84 85 86                 # one row each: state, head sha, mergeable, checks fail=/pending=/pass=, unresolved threads, comments
+jx pr show 89 --files --body        # plus changed files with +/- and the body, after the table
+jx pr comments 87 --since mine      # top-level comments and review verdicts posted after your last one (also: push, 6h, ISO)
+jx pr edit 87 --body-file body.md --dry-run   # unified diff of the body (and title change) against what is on GitHub
+jx pr edit 87 --body-file body.md             # PATCH, then re-read and print {"verified": true}
+```
+
+`show` replaces `gh pr view --json ... --jq` and `for n in ...` loops; `comments` covers what
+`threads` does not (issue comments and review summaries); `edit` is outward, so dry-run first.
+
 ## PR review loop
 
 ```bash
@@ -36,7 +49,14 @@ jx ci failed <run_id> [--attempt 1]      # every failed job: failed steps + erro
 jx ci logs <job_id> --grep 'pattern' -C 3   # one job's log, timestamps and ANSI stripped; --tail N without --grep
 jx ci dispatch some.yml --ref my-branch -f key=value --wait   # workflow_dispatch, resolve the new run id, wait
 jx ci wait <run_id>                      # exit 0 only on success
+jx ci timings <run_id>                   # per job: queue wait, seconds, pytest passed/failed/skipped/deselected + test seconds, slowest step
+jx ci runs ci.yml --branch b --limit 3 | jx ci timings -   # compare runs (e.g. shards before and after) in one table
+jx ci timings <run_id> --steps           # one row per step; reads no logs
 ```
+
+`timings` prints the run's wall time, longest job and total job-seconds on stderr. Pytest counts
+are summed over every result line in a job's log, so a job that runs pytest twice reports both
+(`pytest_runs`). `--no-tests` skips the log downloads.
 
 `failed` greps for `##[error]`, `error`, `traceback`, `failed`, `exit code N` by default. A job can
 fail with no `FAILED` line, so read the hits, not just the count. `gh run view --log-failed` only

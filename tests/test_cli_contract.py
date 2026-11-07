@@ -11,9 +11,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLS = ["pr", "ci", "k", "aws", "obs", "tf", "git", "temporal", "oncall", "mem", "tx", "modal"]
-WRITERS = {("pr", "reply"), ("pr", "comment"), ("ci", "dispatch"), ("mem", "add"), ("mem", "append"), ("mem", "edit"), ("mem", "doctor")}
-SINCE_TOOLS = ["aws", "obs", "oncall", "temporal", "modal", "tx"]
+TOOLS = ["pr", "ci", "k", "aws", "obs", "tf", "git", "temporal", "oncall", "mem", "tx", "modal", "venv"]
+WRITERS = {("pr", "reply"), ("pr", "comment"), ("pr", "edit"), ("ci", "dispatch"), ("venv", "path"), ("venv", "rm"), ("mem", "add"), ("mem", "append"), ("mem", "edit"), ("mem", "doctor")}
+SINCE_TOOLS = ["aws", "obs", "oncall", "temporal", "modal", "tx", "pr", "venv"]
 STDIN_TOOLS = ["ci", "temporal", "oncall", "modal", "k"]
 
 
@@ -109,7 +109,7 @@ class Contract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"PATH": tmp, "HOME": tmp}  # empty PATH: no aws, gh, kubectl, temporal, terraform, modal, git
             for argv in (["aws", "whoami"], ["modal", "whoami"], ["k", "dev", "doctor"], ["temporal", "dev", "doctor"],
-                         ["tf", "doctor"], ["ci", "doctor"], ["pr", "doctor"], ["review", "1", "--out", f"{tmp}/r"]):
+                         ["tf", "doctor"], ["ci", "doctor"], ["pr", "doctor"], ["venv", "doctor"], ["review", "1", "--out", f"{tmp}/r"]):
                 p = subprocess.run([sys.executable, ROOT / "tools" / f"{argv[0]}.py", *argv[1:]], env=env, cwd=ROOT, text=True, capture_output=True)
                 self.assertNotIn("Traceback", p.stderr, argv)
                 self.assertIn("not found on PATH", p.stderr, argv)

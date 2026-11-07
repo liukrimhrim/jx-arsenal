@@ -5,6 +5,7 @@
   jx ci jobs <run-id|-> [--attempt N]                           jobs of a run; --attempt reads an earlier attempt
   jx ci logs <job-id|-> [--grep PAT] [-C N] [--tail N]          one job's log, timestamps stripped
   jx ci failed <run-id|-> [--attempt N] [--grep PAT] [-C N]     every failed job of a run: header + matching log lines
+  jx ci timings <run-id|-> [--attempt N] [--steps] [--no-tests]  per job: queue wait, seconds, pytest counts and test seconds, slowest step
   jx ci dispatch <workflow> [--ref R] [-f k=v ...] [--wait] [--dry-run]   workflow_dispatch, then resolve the new run id
   jx ci wait <run-id|-> [--interval S] [--timeout S]            block until the run completes; exit 1 unless success
 
@@ -28,6 +29,7 @@ NOT_FOUND = {
     "jobs": "run id not found. `jx ci runs <workflow> [--branch B]` lists run ids; `jx pr ci <n> --failed` gives run_id per failed check.",
     "failed": "run id not found. `jx ci runs <workflow> [--branch B]` lists run ids; `jx pr ci <n> --failed` gives run_id per failed check.",
     "wait": "run id not found. `jx ci runs <workflow> [--branch B]` lists run ids.",
+    "timings": "run id not found. `jx ci runs <workflow> [--branch B]` lists run ids; pipe it in: `jx ci runs <workflow> --limit 3 | jx ci timings -`.",
     "logs": "job id not found, or its log expired (90 days). `jx ci jobs <run_id>` lists job ids; `jx pr ci <n> --failed` gives job_id per failed check.",
 }
 
@@ -69,9 +71,7 @@ def ids(arg, col):
     return out
 
 def dur(a, b):
-    if not a or not b: return ""
-    f = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
-    return f"{int((f(b) - f(a)).total_seconds())}s"
+    s = secs(a, b); return "" if s is None else f"{s}s"
 
 # ---------------- runs ----------------
 def cmd_runs(args):
@@ -140,6 +140,46 @@ def cmd_failed(args):
         print("\n".join(out[-args.max_lines:]) if out else "(no matching lines; try --grep or `jx ci logs <job-id>`)"); print()
     sys.exit(1)
 
+# ---------------- timings ----------------
+PYTEST = re.compile(r"\b(\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed)(?:, \d+ \w+)*) in ([\d.]+)s\b")
+PLURAL = {"error": "errors", "warning": "warnings"}
+
+def pytest_summary(lines):
+    """Sum every pytest result line in a log (`1 failed, 3 passed, 7 deselected in 262.20s`); a job may run pytest more than once."""
+    tot = {"pytest_runs": 0}
+    for l in lines:
+        m = PYTEST.search(l)
+        if not m: continue
+        tot["pytest_runs"] += 1; tot["test_secs"] = round(tot.get("test_secs", 0) + float(m.group(2)), 1)
+        for n, w in re.findall(r"(\d+) (\w+)", m.group(1)): w = PLURAL.get(w, w); tot[w] = tot.get(w, 0) + int(n)
+    return tot
+
+def secs(a, b):
+    if not a or not b: return None
+    f = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return int((f(b) - f(a)).total_seconds())
+
+def cmd_timings(args):
+    repo = repo_of(args); rows, steps = [], []
+    for rid in ids(args.run_id, "run_id"):
+        js = sorted(jobs_of(rid, args.attempt, repo), key=lambda j: j["name"])
+        for j in js:
+            st = [{"run_id": rid, "job": j["name"], "step": s["name"], "conclusion": s["conclusion"], "secs": secs(s.get("started_at"), s.get("completed_at"))} for s in j.get("steps") or []]
+            steps += st; top = max(st, key=lambda s: s["secs"] or 0, default={})
+            r = {"run_id": rid, "job_id": j["id"], "name": j["name"], "conclusion": j["conclusion"] or j["status"], "queued": secs(j.get("created_at"), j["started_at"]),
+                 "secs": secs(j["started_at"], j["completed_at"]), "slowest_step": top.get("step"), "step_secs": top.get("secs")}
+            if not (args.no_tests or args.steps) and j["status"] == "completed":
+                try: r.update(pytest_summary(job_log(j["id"], repo)))
+                except SystemExit: pass  # expired or missing log: sh() already said why; keep the timing row
+            rows.append(r)
+        done = [j for j in js if j["completed_at"]]
+        if done:
+            long = max(done, key=lambda j: secs(j["started_at"], j["completed_at"]) or 0)
+            sys.stderr.write(f"run {rid}: wall {secs(min(j['created_at'] for j in js), max(j['completed_at'] for j in done))}s, longest job {long['name']} "
+                             f"{secs(long['started_at'], long['completed_at'])}s, {sum(secs(j['started_at'], j['completed_at']) or 0 for j in done)} job-seconds over {len(js)} jobs\n")
+    if args.steps: emit(steps, ["run_id", "job", "step", "conclusion", "secs"], args); return
+    emit(rows, ["run_id", "job_id", "name", "conclusion", "queued", "secs", "passed", "failed", "errors", "skipped", "deselected", "test_secs", "pytest_runs", "slowest_step", "step_secs"], args)
+
 # ---------------- dispatch / wait ----------------
 def cmd_wait(args):
     deadline = time.time() + args.timeout; rc = 0
@@ -192,6 +232,9 @@ def main():
     p.add_argument("job_id", help="an id, or - to read a job_id column from TSV on stdin"); p.add_argument("--grep", help="python regex; prints matching lines with context instead of the tail"); p.add_argument("-C", type=int, default=2, help="context lines around each --grep hit (2)"); p.add_argument("--tail", type=int, default=200, help="lines to print without --grep (200)"); p.set_defaults(f=cmd_logs)
     p = sp.add_parser("failed", parents=[g], help="every failed job of a run: failed steps plus error-ish log lines in context")
     p.add_argument("run_id", help="an id, or - to read a run_id column from TSV on stdin"); p.add_argument("--attempt", type=int, help="read this attempt; 1 = the original failure after a rerun"); p.add_argument("--grep", default=ERRISH, help="regex for log lines to show (default matches error/traceback/failed/exit code)"); p.add_argument("-C", type=int, default=2, help="context lines around each hit (2)"); p.add_argument("--max-lines", type=int, default=120, help="cap on printed lines per job (120)"); p.set_defaults(f=cmd_failed)
+    p = sp.add_parser("timings", parents=[g], help="per job: queue wait, duration, pytest counts and seconds from the log, slowest step; run wall time on stderr")
+    p.add_argument("run_id", help="an id, or - to read run ids from TSV on stdin (`jx ci runs` output works as is)"); p.add_argument("--attempt", type=int, help="read this attempt instead of the latest")
+    p.add_argument("--steps", action="store_true", help="one row per step instead of per job; reads no logs"); p.add_argument("--no-tests", action="store_true", help="skip log downloads, so no pytest columns"); p.set_defaults(f=cmd_timings)
     p = sp.add_parser("dispatch", parents=[g], help="workflow_dispatch a workflow and resolve the new run id; --dry-run shows the command")
     p.add_argument("workflow", help="workflow file name"); p.add_argument("--ref", help="branch or tag; default is the current branch"); p.add_argument("-f", dest="inputs", action="append", default=[], metavar="k=v", help="workflow input, repeatable"); p.add_argument("--wait", action="store_true", help="block until the run completes")
     p.add_argument("--dry-run", action="store_true", help="print the gh command, trigger nothing"); p.add_argument("--interval", type=int, default=30, help="seconds between polls when waiting (30)"); p.add_argument("--timeout", type=int, default=3600, help="give up waiting after this many seconds (3600)"); p.set_defaults(f=cmd_dispatch)
