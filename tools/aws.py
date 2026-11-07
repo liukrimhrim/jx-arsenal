@@ -32,7 +32,8 @@ NOT_FOUND = {
 def aws(args, a, ok=(0,)):
     p_ = a.profile or os.environ.get("AWS_PROFILE")
     cmd = ["aws", "--output", "json", "--no-cli-pager"] + (["--profile", p_] if p_ else []) + (["--region", a.region] if a.region else []) + args
-    p = subprocess.run(cmd, text=True, capture_output=True, env={**os.environ, "TZ": "UTC"})
+    try: p = subprocess.run(cmd, text=True, capture_output=True, env={**os.environ, "TZ": "UTC"})
+    except FileNotFoundError: sys.exit("`aws` not found on PATH; install the AWS CLI, then `jx aws whoami`")
     if p.returncode not in ok:
         err = p.stderr.strip()
         if re.search(r"token|sso|expired|InvalidGrant|credentials|could not be found|Unable to locate", err, re.I):

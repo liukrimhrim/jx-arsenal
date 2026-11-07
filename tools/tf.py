@@ -23,7 +23,8 @@ BACKEND = re.compile(r'backend\s+"([^"]+)"\s*\{(.*?)\n\s*\}', re.S)
 
 def run(root, *args, env=None):
     """Run one terraform command in `root`, non-interactive and uncoloured. Returns (rc, stdout, stderr)."""
-    p = subprocess.run([*TF, f"-chdir={root}", *args], text=True, capture_output=True, env={**os.environ, **env} if env else None)
+    try: p = subprocess.run([*TF, f"-chdir={root}", *args], text=True, capture_output=True, env={**os.environ, **env} if env else None)
+    except FileNotFoundError: sys.exit("`terraform` not found on PATH; install it, then `jx tf doctor`")
     return p.returncode, p.stdout, p.stderr
 
 def init(root, upgrade=False):

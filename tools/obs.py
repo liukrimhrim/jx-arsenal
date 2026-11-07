@@ -33,7 +33,8 @@ def env_of(name):
     return envs[name]
 
 def creds(profile):
-    p = subprocess.run(["aws", "configure", "export-credentials", "--profile", profile, "--format", "process"], text=True, capture_output=True)
+    try: p = subprocess.run(["aws", "configure", "export-credentials", "--profile", profile, "--format", "process"], text=True, capture_output=True)
+    except FileNotFoundError: sys.exit("`aws` not found on PATH; install the AWS CLI, then `jx aws -p <profile> whoami`")
     if p.returncode: sys.exit(p.stderr.strip() + f"\n→ `jx aws -p {profile} whoami`; if expired, `aws sso login --profile {profile}`")
     return json.loads(p.stdout)
 

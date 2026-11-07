@@ -27,7 +27,8 @@ NOT_FOUND = {
 }
 
 def sh(args, stdin=None):
-    p = subprocess.run(args, input=stdin, text=True, capture_output=True)
+    try: p = subprocess.run(args, input=stdin, text=True, capture_output=True)
+    except FileNotFoundError: sys.exit("`gh` not found on PATH; install the GitHub CLI, then `gh auth login`")
     if p.returncode:
         err = p.stderr.strip() or p.stdout.strip()
         if re.search(r"auth|login|token|401|403", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
@@ -128,8 +129,9 @@ def cmd_since(args):
 
 # ---------------- ci ----------------
 def checks(args):
-    p = subprocess.run(["gh", "pr", "checks", str(args.n), "--json", "name,state,bucket,link,workflow"] + (["-R", args.repo] if args.repo else []),
-                       text=True, capture_output=True)
+    try: p = subprocess.run(["gh", "pr", "checks", str(args.n), "--json", "name,state,bucket,link,workflow"] + (["-R", args.repo] if args.repo else []),
+                            text=True, capture_output=True)
+    except FileNotFoundError: sys.exit("`gh` not found on PATH; install the GitHub CLI, then `gh auth login`")
     if p.returncode == 1 and not p.stdout.strip() and p.stderr.strip().startswith("no checks reported on the "):
         return []
     if p.returncode not in (0, 1, 8) or not p.stdout.strip():  # 8 = pending, 1 = failing

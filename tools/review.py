@@ -82,7 +82,10 @@ def die(message, code=2):
 
 
 def run(*cmd, ok=(0,)):
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die(f"`{cmd[0]}` not found on PATH; install it, then retry")
     if p.returncode not in ok:
         die(f"{' '.join(cmd[:4])} ... exited {p.returncode}: {p.stderr.strip()[:400]}")
     return p.stdout
