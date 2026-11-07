@@ -23,6 +23,7 @@ that posts or mutates · `--help` and a `doctor` subcommand per tool · errors n
 | `jx oncall` | incident.io and PagerDuty, read-only: who is on call on every schedule, open incidents across both, alerts and alert grouping, one incident with its alerts and timeline, escalations, users, routes, a provider reconciliation count, and a raw `api` GET with pagination. Tokens from env or a configured command, never printed |
 | `jx mem`, `jx tx` | the agent's own bookkeeping: memory files of the current project (list, show, grep, add with a duplicate check, append, edit, doctor for index drift) and session transcripts (sessions, grep, the Bash commands run, one session's messages) |
 | `jx modal` | Modal, read-only: apps and task counts, running containers with per-app counts sampled over time, past or briefly followed logs with UTC timestamps, deploy history, spend per app with share, secrets/volumes/environments |
+| `jx bench`, `jx tx usage` | measure the arsenal itself: what each session cost in model calls, tokens, model vs tool time and Bash mix, and a paired benchmark that answers the same factual questions with the tools present and hidden |
 
 `jx ls` prints every command on one line each. Dispatcher: `bin/jx`; tools: `tools/*.py`; notes: `docs/`.
 
