@@ -201,14 +201,17 @@ def cmd_failed(a):
     env = env_of(a.env); q = " AND ".join(filter(None, [build_query(a), 'ExecutionStatus IN ("Failed", "TimedOut", "Terminated")']))
     with forward(env) as addr:
         execs = tcli(addr, env, "workflow", "list", "--limit", str(a.limit), "--query", q) or []
-        for e in execs: e["failure"] = close_failure(tcli(addr, env, "workflow", "describe", "--workflow-id", e["execution"]["workflowId"], "--run-id", e["execution"]["runId"]))[0][:120]
+        from concurrent.futures import ThreadPoolExecutor  # one describe per execution; serial, 200 of them took over two minutes
+        def describe(e): return close_failure(tcli(addr, env, "workflow", "describe", "--workflow-id", e["execution"]["workflowId"], "--run-id", e["execution"]["runId"]))[0][:120]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for e, f in zip(execs, pool.map(describe, execs)): e["failure"] = f
     rows = [{"workflow_id": e["execution"]["workflowId"], "type": e["type"]["name"], "close": ts(e.get("closeTime")), "status": short_status(e.get("status")), "failure": e["failure"]} for e in execs]
     if a.group:
         groups = {}
         for r in rows: groups.setdefault(r["failure"], {"failure": r["failure"], "count": 0, "example_id": r["workflow_id"]})["count"] += 1
         rows = sorted(groups.values(), key=lambda r: -r["count"]); emit(rows, ["failure", "count", "example_id"], a, execs)
     else: emit(rows, ["workflow_id", "type", "close", "status", "failure"], a, execs)
-    sys.stderr.write(f"{len(execs)} executions described, capped at --limit {a.limit}  query: {q}  → `jx temporal {a.env} history <workflow_id> --failures` for one\n")
+    sys.stderr.write(f"{len(execs)} most recent executions described (sample size = --limit {a.limit}; about 2s per 100 more)  query: {q}  → `jx temporal {a.env} count --since ... --by-status` for the population, `jx temporal {a.env} history <workflow_id> --failures` for one\n")
 
 def cmd_queue(a):
     env = env_of(a.env); kinds = ["workflow", "activity"] if a.type == "both" else [a.type]; rows, raw = [], {}

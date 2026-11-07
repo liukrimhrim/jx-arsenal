@@ -2,6 +2,8 @@
 """jx tx — the agent's own session transcripts for the current project. TSV by default, --json for raw.
 
   jx tx sessions [--since 7d] [--limit 30] [--grep REGEX]   sessions newest first: id, started, last, messages, title (or first prompt)
+  jx tx usage [--since 7d] [--limit 50] [--grep REGEX] [--by session|day|week]
+                                                 what each session cost: model calls, output/thinking/input tokens, wall vs model vs tool minutes, Bash calls split jx / heredoc / raw
   jx tx grep <REGEX> [--since 7d] [--role user|assistant|any] [--sessions N] [--limit 100] [--subagents]   matching messages: session, time, role, snippet
   jx tx cmds [--grep REGEX] [--since 7d] [--sessions N] [--limit 200] [--full]   Bash commands past sessions ran: session, time, description, command
   jx tx show <session-prefix> [--role R] [--limit 50] [--grep REGEX] [--tools]   one session's messages in order: time, role, text
@@ -145,6 +147,68 @@ def cmd_show(a):
         if len(rows) >= a.limit: break
     emit(rows, ["time", "role", "text"], a); sys.stderr.write(f"{len(rows)} messages\n")
 
+# ---------------- usage: what each session cost ----------------
+def usage_of(path, since_dt=None):
+    """Per-session cost from the transcript: distinct model calls (requestId), tokens, wall time, model vs tool time, tool mix.
+    Model time is the gap from a tool_result or user text to the next assistant record; tool time is tool_use to tool_result."""
+    import collections
+    calls = set(); tok = collections.Counter(); first = last = None; pending = {}; tool_s = 0.0; model_s = 0.0; last_input_ts = None
+    bash = collections.Counter(); title = None; models = collections.Counter(); n_user = 0
+    def P(s): return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    for r in records(path):
+        t = r.get("type")
+        if t == "custom-title": title = r.get("customTitle") or title
+        if t not in ("user", "assistant"): continue
+        t_s = r.get("timestamp"); m = r.get("message") or {}; c = m.get("content")
+        first = first or t_s; last = t_s or last  # wall time spans the first user message to the last record of either side
+        if t == "assistant":
+            if r.get("requestId") not in calls and m.get("usage"):
+                u = m["usage"]; calls.add(r.get("requestId")); models[m.get("model")] += 1
+                for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"): tok[k] += u.get(k) or 0
+                tok["thinking_tokens"] += (u.get("output_tokens_details") or {}).get("thinking_tokens") or 0
+                if last_input_ts and t_s: model_s += max(0.0, (P(t_s) - P(last_input_ts)).total_seconds()); last_input_ts = None
+            for p in c or [] if isinstance(c, list) else []:
+                if p.get("type") == "tool_use":
+                    pending[p["id"]] = t_s
+                    if p.get("name") == "Bash":
+                        cmd = (p.get("input") or {}).get("command", "")
+                        kind = "jx" if re.search(r"(^|[\s;&|(])jx\s", cmd) else "heredoc" if re.search(r"python3?\s+(-\w+\s+)*(-\s*<<|-c\b)", cmd) else "raw"
+                        bash[kind] += 1
+        else:
+            n_user += 1
+            if isinstance(c, list):
+                for p in c:
+                    if p.get("type") == "tool_result" and p.get("tool_use_id") in pending and t_s:
+                        tool_s += max(0.0, (P(t_s) - P(pending.pop(p["tool_use_id"]))).total_seconds())
+            last_input_ts = t_s
+    wall = (P(last) - P(first)).total_seconds() if first and last else 0
+    return {"session": os.path.basename(path)[:-6][:8], "title": (title or "")[:50], "model": "/".join(sorted(k for k in models if k)), "calls": len(calls),
+            "out_tok": tok["output_tokens"], "think_tok": tok["thinking_tokens"], "in_tok": tok["input_tokens"] + tok["cache_creation_input_tokens"], "cache_read": tok["cache_read_input_tokens"],
+            "wall_min": round(wall / 60, 1), "model_min": round(model_s / 60, 1), "tool_min": round(tool_s / 60, 1),
+            "bash": sum(bash.values()), "jx": bash["jx"], "heredoc": bash["heredoc"], "raw": bash["raw"], "started": ts(first)}
+
+def cmd_usage(a):
+    d = proj_dir(a); floor = since(a.since) if a.since else None; rows = []
+    for f in sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True):
+        if floor and datetime.fromtimestamp(os.path.getmtime(f), timezone.utc) < floor: break
+        u = usage_of(f)
+        if a.grep and not re.search(a.grep, u["title"], re.I): continue
+        if u["calls"] == 0: continue
+        rows.append(u)
+        if len(rows) >= a.limit: break
+    if a.by in ("day", "week"):
+        import collections
+        g = collections.defaultdict(lambda: collections.Counter()); n = collections.Counter()
+        for r in rows:
+            k = r["started"][:10] if a.by == "day" else datetime.fromisoformat(r["started"].replace("Z", "+00:00")).strftime("%G-W%V")
+            n[k] += 1
+            for f in ("calls", "out_tok", "think_tok", "in_tok", "cache_read", "wall_min", "model_min", "tool_min", "bash", "jx", "heredoc", "raw"): g[k][f] += r[f]
+        rows = [{a.by: k, "sessions": n[k], **{f: round(v, 1) for f, v in g[k].items()}} for k in sorted(g, reverse=True)]
+        header = [a.by, "sessions", "calls", "out_tok", "think_tok", "in_tok", "cache_read", "wall_min", "model_min", "tool_min", "bash", "jx", "heredoc", "raw"]
+    else: header = ["session", "started", "calls", "out_tok", "think_tok", "in_tok", "cache_read", "wall_min", "model_min", "tool_min", "bash", "jx", "heredoc", "raw", "model", "title"]
+    emit(rows, header, a)
+    if rows and a.by == "session": sys.stderr.write(f"{len(rows)} sessions; per session median calls {sorted(r['calls'] for r in rows)[len(rows)//2]}, median out_tok {sorted(r['out_tok'] for r in rows)[len(rows)//2]}\n")
+
 def main():
     ap = argparse.ArgumentParser(prog="jx tx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--json", action="store_true", help="JSON rows instead of TSV"); ap.add_argument("--project", help="checkout path whose transcripts to read (cwd)")
@@ -161,6 +225,9 @@ def main():
     p = sp.add_parser("show", parents=[g], help="the messages of one session in order"); p.add_argument("session", help="session id or unique prefix; `jx tx sessions` lists them")
     p.add_argument("--role", choices=["user", "assistant", "any"], default="any", help="which side of the conversation (any)"); p.add_argument("--limit", type=int, default=50, help="max messages (50)")
     p.add_argument("--grep", help="regex over the message text (none)"); p.add_argument("--tools", action="store_true", help="include tool_use and tool_result parts (off)"); p.set_defaults(f=cmd_show)
+    p = sp.add_parser("usage", parents=[g], help="per-session model calls, tokens, time split and Bash mix; --by aggregates per day or week")
+    p.add_argument("--since", help="only sessions touched within 30m, 6h, 7d, 2w or since an ISO time"); p.add_argument("--limit", type=int, default=50, help="max sessions scanned (50)"); p.add_argument("--grep", help="regex over the title")
+    p.add_argument("--by", default="session", choices=["session", "day", "week"], help="row granularity (session)"); p.set_defaults(f=cmd_usage)
     a = ap.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()
