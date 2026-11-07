@@ -37,6 +37,7 @@ jx tx grep 'timeout' --subagents            # include subagent transcripts, role
 jx tx cmds --grep kubectl --since 7d        # the Bash commands past sessions ran, with their descriptions
 jx tx cmds --full --sessions 3              # whole commands, newlines escaped
 jx tx show <session-prefix> --limit 40      # one session's messages in order; --tools shows tool calls
+jx tx usage --since 7d [--by week]          # what each session cost; see docs/bench.md
 ```
 
 Everything streams line by line and stops early; `sessions` counts messages with a substring check

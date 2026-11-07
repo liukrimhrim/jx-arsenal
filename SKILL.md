@@ -31,6 +31,7 @@ jx temporal prod failed --since 6h --group                 # what is failing and
 jx oncall who                                              # who is paged first on every schedule, both providers
 jx mem ls --grep 'commit|branch'                            # recall before writing; jx mem add refuses near-duplicates
 jx tx cmds --grep kubectl --since 7d                        # what did past sessions actually run
+jx tx usage --since 7d                                      # calls, tokens, model vs tool minutes, jx vs heredoc per session
 jx modal containers my-app --watch 300                      # container count sampled over time, no poll loop
 ```
 
