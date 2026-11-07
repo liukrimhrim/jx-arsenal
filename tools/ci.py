@@ -32,7 +32,8 @@ NOT_FOUND = {
 }
 
 def sh(args, stdin=None, ok=(0,)):
-    p = subprocess.run(args, input=stdin, text=True, capture_output=True)
+    try: p = subprocess.run(args, input=stdin, text=True, capture_output=True)
+    except FileNotFoundError: sys.exit("`gh` not found on PATH; install the GitHub CLI, then `gh auth login`")
     if p.returncode not in ok:
         err = p.stderr.strip() or p.stdout.strip()
         if re.search(r"auth|login|token|401|403", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2

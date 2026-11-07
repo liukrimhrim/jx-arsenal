@@ -40,6 +40,7 @@ def modal(a, *args, parse=True, timeout=120):
     if a.env and tuple(args[:2]) in ENV_AWARE: cmd += ["--env", a.env]
     if a.profile: cmd += ["--profile", a.profile]
     try: p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except FileNotFoundError: sys.exit("`modal` not found on PATH; install the Modal CLI, then `jx modal whoami`")
     except subprocess.TimeoutExpired as e: return (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
     if p.returncode:
         err = p.stderr.strip() or p.stdout.strip()

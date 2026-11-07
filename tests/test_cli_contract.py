@@ -3,7 +3,9 @@ one --since grammar, a health subcommand, and stdin `-` where the command takes 
 import argparse
 import importlib.util
 import io
+import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -102,6 +104,18 @@ class Contract(unittest.TestCase):
                 self.assertEqual(fn("literal", "pod"), ["literal"], t)
             finally:
                 sys.stdin = saved
+
+    def test_missing_cli_names_the_fix_instead_of_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"PATH": tmp, "HOME": tmp}  # empty PATH: no aws, gh, kubectl, temporal, terraform, modal, git
+            for argv in (["aws", "whoami"], ["modal", "whoami"], ["k", "dev", "doctor"], ["temporal", "dev", "doctor"],
+                         ["tf", "doctor"], ["ci", "doctor"], ["pr", "doctor"], ["review", "1", "--out", f"{tmp}/r"]):
+                p = subprocess.run([sys.executable, ROOT / "tools" / f"{argv[0]}.py", *argv[1:]], env=env, cwd=ROOT, text=True, capture_output=True)
+                self.assertNotIn("Traceback", p.stderr, argv)
+                self.assertIn("not found on PATH", p.stderr, argv)
+                self.assertNotEqual(p.returncode, 0, argv)
+            p = subprocess.run([sys.executable, ROOT / "bin" / "jx", "doctor"], env=env, cwd=ROOT, text=True, capture_output=True)
+            self.assertNotIn("Traceback", p.stdout + p.stderr)
 
     def test_git_wt_rm_has_force(self):
         self.assertTrue(any("--force" in a.option_strings for a in self.subs["git"]["wt"]._actions))

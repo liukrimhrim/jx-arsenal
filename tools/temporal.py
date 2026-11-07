@@ -20,7 +20,7 @@ JSON output, prints TSV. --json for the raw payload.
 Defaults: k8s namespace `temporal`, the first Service whose name ends in `frontend-headless`, Temporal namespace `default`.
 Filters compose into a visibility query: WorkflowType, ExecutionStatus, TaskQueue, StartTime >= now-since, AND --query verbatim.
 """
-import argparse, contextlib, io, json, os, re, signal, socket, subprocess, sys, time
+import argparse, contextlib, io, json, os, re, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timedelta, timezone
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 CFG = os.path.expanduser("~/.config/jx-arsenal/temporal.json")
@@ -275,6 +275,8 @@ def main():
     sp.add_parser("doctor", parents=[g], help="port-forward works, server version, namespace retention").set_defaults(f=cmd_doctor)
     sp.choices["describe"].set_defaults(f=lambda a: each(a, "workflow_id", "workflow_id", cmd_describe)); sp.choices["history"].set_defaults(f=lambda a: each(a, "workflow_id", "workflow_id", cmd_history))
     a = ap.parse_args()
+    for b in ("kubectl", "temporal"):
+        if not shutil.which(b): sys.exit(f"`{b}` not found on PATH; install it, then `jx temporal <env> doctor`")
     if a.env != "all": a.f(a); return
     first = True
     for env in all_envs():

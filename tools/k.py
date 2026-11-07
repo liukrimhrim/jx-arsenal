@@ -15,7 +15,7 @@
   {"envs": {"prod": {"context": "arn:aws:eks:...:cluster/x"}, "stage": {"context": "stage-cluster"}}}
 The file also defines the env list `jx k all` uses. Nothing cluster-specific lives in this script.
 """
-import argparse, base64, contextlib, io, json, os, re, subprocess, sys, signal
+import argparse, base64, contextlib, io, json, os, re, shutil, subprocess, sys, signal
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timezone
 
@@ -225,6 +225,7 @@ def main(argv=None):
     p = sp.add_parser("secret", parents=[g], help="one key of a secret, base64-decoded, to stdout"); p.add_argument("name", help="secret name"); p.add_argument("key", help="data key; a wrong key lists the real ones"); ns(p, False); p.set_defaults(f=cmd_secret)
     sp.add_parser("doctor", parents=[g], help="context exists, server reachable, version, can-i get pods").set_defaults(f=cmd_doctor)
     args = ap.parse_args(argv); CMD = args.cmd
+    if not shutil.which("kubectl"): sys.exit("`kubectl` not found on PATH; install it, then `jx k <env> doctor`")
     if args.env != "all": args.f(args); return
     if args.cmd in ("secret", "logs", "rollout"): sys.exit(f"`jx k all {args.cmd}` not supported; one env at a time")
     first = True
