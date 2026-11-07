@@ -102,7 +102,7 @@ def cmd_jobs(args):
 
 # ---------------- logs ----------------
 def job_log(job_id, repo):
-    raw = gh("api", "--allow-escape-sequences", f"/repos/{repo}/actions/jobs/{job_id}/logs")
+    raw = gh("api", f"/repos/{repo}/actions/jobs/{job_id}/logs")
     raw = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw)  # ANSI colour codes from tool output
     return [re.sub(r"^\S+T\S+Z ", "", ln) for ln in raw.splitlines()]
 
