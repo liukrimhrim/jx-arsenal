@@ -3,6 +3,25 @@
 These commands replace repeated collection and reporting. They do not choose tests,
 judge a review finding, approve an external action, or establish runtime behavior.
 
+## jx hint (Claude Code)
+
+`jx agent hint` is a PreToolUse hook on Bash. When a command matches a raw loop that a jx command
+replaces (`gh pr view --json`, `gh api …/actions/jobs/…`, `gh run view`, `git show REF:path`,
+`uv venv`, transcript JSONL scans, `kubectl -o json | jq`, `aws … | jq`, `terraform show -json`),
+it returns `additionalContext` naming the jx command. It never returns a permission decision, so
+the command runs as written; each pattern is shown at most once per session (state in
+`$TMPDIR/jx-hints-<session>`); any error exits 0 silently. About 50 ms per Bash call.
+
+Register it in `~/.claude/settings.json`. Keep `|| true`: a hook that exits 2 blocks the command.
+
+```json
+{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
+  "command": "\"$HOME/code/jx-arsenal/bin/jx\" agent hint 2>/dev/null || true", "timeout": 5}]}]}}
+```
+
+The patterns live in `HINTS` in `tools/agent.py`; add one when `jx tx cmds` shows a raw loop that
+a jx command already answers.
+
 ## Delegation guard (Codex)
 
 `tools/agent.py hook` runs only on agent launches and handoffs. It rewrites

@@ -136,5 +136,35 @@ class AgentHookTests(unittest.TestCase):
         self.assertIn("uncommitted", p.stderr)
 
 
+
+class AgentHintTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.env = {**os.environ, "TMPDIR": self.temp.name}
+
+    def hint(self, command, session="s1", raw=None):
+        event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": session, "tool_input": {"command": command}}
+        p = subprocess.run([sys.executable, str(SCRIPT), "hint"], input=raw if raw is not None else json.dumps(event),
+                           text=True, capture_output=True, env=self.env)
+        self.assertEqual((p.returncode, p.stderr), (0, ""))
+        return json.loads(p.stdout)["hookSpecificOutput"] if p.stdout else None
+
+    def test_raw_loop_gets_context_and_no_permission_decision(self):
+        out = self.hint("gh pr view 87 --json state,headRefOid --jq .state")
+        self.assertEqual(set(out), {"hookEventName", "additionalContext"})
+        self.assertIn("jx pr show", out["additionalContext"])
+        self.assertIn("jx git cat", self.hint("git show origin/main:docs/PLAN.md | sed -n 1,40p")["additionalContext"])
+
+    def test_once_per_pattern_per_session(self):
+        self.assertIsNotNone(self.hint("gh run view 1 --json jobs"))
+        self.assertIsNone(self.hint("gh api repos/o/r/actions/jobs/2/logs"))
+        self.assertIsNotNone(self.hint("gh run view 1 --json jobs", session="s2"))
+
+    def test_quiet_on_ordinary_commands_and_bad_input(self):
+        for c in ("ls -la", "git show --stat --format='%h:%s' HEAD", "jx pr show 87", "git show HEAD~1 -- a.py"):
+            self.assertIsNone(self.hint(c), c)
+        self.assertIsNone(self.hint("", raw="not json"))
+
+
 if __name__ == "__main__":
     unittest.main()
