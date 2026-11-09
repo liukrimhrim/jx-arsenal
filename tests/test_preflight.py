@@ -277,6 +277,15 @@ class HygieneAndRunnerTests(Base):
         code, rows, _ = r.run("--only", "pack.bad")
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
+    def test_receipt_records_head_tier_and_open_items(self):
+        r = self.repo({"a.py": "x = 1\n", ".jx/pack.py": 'print("pack.q\\task\\ta.py\\t1\\tanswer me\\tPR 1")\n',
+                       ".jx/preflight.json": json.dumps({"checks": [{"id": "pack.q", "cmd": "python3 .jx/pack.py"}]})})
+        r.commit({"a.py": "x = 2\n"})
+        code, rows, _ = r.run("--only", "pack.q")
+        rec = json.loads((r.path / ".git" / "preflight" / f"{r.git('rev-parse', 'HEAD')}.fast.json").read_text())
+        self.assertEqual((code, rec["tier"], rec["dirty"], rec["partial"]), (0, "fast", False, True))
+        self.assertEqual([x["id"] for x in rec["open"]], [rows[0]["id"]])
+
     def test_dry_run_and_ls(self):
         r = self.repo({"a.py": "x = 1\n"})
         p = subprocess.run([sys.executable, str(JX), "preflight", "run", "--base", "main", "--dry-run"], cwd=r.path, text=True, capture_output=True)
