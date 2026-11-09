@@ -90,6 +90,30 @@ class ReachTests(Base):
         rows = r.run("--only", "refs.old-literal")[1]
         self.assertEqual([x["line"] for x in self.hits(rows, "refs.old-literal")], [1])
 
+    def test_namesake_doc_naming_what_changed_asks(self):
+        base = {"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16",)\n', "pkg/other.py": "X = 1\n",
+                "pkg/ENGINE_SMOKE.md": "# Engine smoke\n\nArms: `stock-w4a16` and `optimized-d2b`, maps under pkg_dir.\n"}
+        r = self.repo(base)
+        r.commit({"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16", "optimized-d2b")\nPIN = {"optimized-d2b": "pkg_dir/x.json"}\n'})
+        _, rows, _ = r.run()
+        hits = self.hits(rows, "docs.namesake", "ask", "pkg/ENGINE_SMOKE.md")
+        self.assertEqual([x["line"] for x in hits], [3])
+        self.assertIn("`optimized-d2b`", hits[0]["message"])
+        self.assertNotIn("pkg_dir", hits[0]["message"])  # a path segment is not a name the doc documents
+        r = self.repo(base)
+        r.commit({"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16",)\nTIMEOUT_S = 5\n', "pkg/other.py": "X = 2\n"})
+        _, rows, _ = r.run()
+        self.assertEqual(self.hits(rows, "docs.namesake"), [])
+
+    def test_path_constant_defined_in_another_module_warns(self):
+        r = self.repo({"pkg/a.py": 'PIN_MAP = "cdl/port/pins/map_h200.json"\n', "pkg/b.py": "X = 1\n"})
+        r.commit({"pkg/b.py": 'MAPS = {"optimized": "cdl/port/pins/map_h200.json"}\n'
+                              'INPUTS = ("cdl/port/pins/map_h200.json",)\nOWN = "cdl/port/pins/map_b300.json"\n'})
+        _, rows, _ = r.run()
+        hits = self.hits(rows, "dup.constants", "warn")
+        self.assertEqual([(x["path"], x["line"]) for x in hits], [("pkg/b.py", 1)])
+        self.assertIn("pkg/a.py:1", hits[0]["message"])
+
     def test_new_sibling_missing_from_registry(self):
         r = self.repo({"exp/A_EVIDENCE.md": "a\n", "exp/B_EVIDENCE.md": "b\n", "exp/INDEX.md": "- A_EVIDENCE.md\n- B_EVIDENCE.md\n"})
         r.commit({"exp/C_EVIDENCE.md": "c\n"})
@@ -253,6 +277,30 @@ class LintTests(Base):
         rows = r.run("--only", "py.*")[1]
         got = sorted((x["check"], x["line"]) for x in rows)
         self.assertEqual(got, [("py.isfinite-int", 8), ("py.json-recursion", 4), ("py.json-subscript", 18), ("py.kill-eperm", 11), ("py.timeout-unhandled", 15)])
+
+    def test_float_ratio_against_a_fractional_threshold_warns(self):
+        r = self.repo({"gate.py": "TILT_MIN = 0.97\n"})
+        r.commit({"gate.py": """
+            TILT_MIN = 0.97
+            TAU_MIN, TAU_K = 0.99, 31
+
+
+            def tilt(c, r, n_p, n_a, p):
+                return (c / n_p) / (r / n_a) < TILT_MIN or p["ratio"] < TAU_MIN
+
+
+            def small(n, ratio):
+                return n < 0.5 or ratio >= 1.0
+            """})
+        _, rows, _ = r.run()
+        self.assertEqual([(x["path"], x["line"]) for x in self.hits(rows, "py.float-threshold", "warn")],
+                         [("gate.py", 6), ("gate.py", 6)])
+
+    def test_path_and_range_code_asks_the_references_checklist(self):
+        r = self.repo({"refs.py": "import os\n"})
+        r.commit({"refs.py": "import os\nbeside = os.path.normpath('a/../b.py')\n"})
+        _, rows, _ = r.run()
+        self.assertTrue([x for x in self.hits(rows, "prompts", "ask", "refs.py") if "[prompt.references]" in x["message"]])
 
     def test_a_command_gate_change_asks_the_gate_checklist(self):
         r = self.repo({"hook.py": "import json\n"})

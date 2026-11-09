@@ -1,7 +1,7 @@
 """Static checks for `jx preflight`. Each check yields (path, line, message[, severity]); `Check` adds id and origin.
 Origins name the past review miss (PR number, review round) a check comes from; ⇢ marks an extrapolation to the same
 failure shape elsewhere."""
-import ast, difflib, fnmatch, hashlib, itertools, json, os, re, subprocess
+import ast, difflib, fnmatch, hashlib, itertools, json, os, posixpath, re, subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -355,6 +355,32 @@ def docs_cochange(ctx):
                 yield y, 1, f"changed together with {x} in {k} of its last {len(with_x)} commits; does it need an update?"
 
 
+WORD = re.compile(r"[A-Za-z_][\w.-]*[\d_-][\w.-]*|[A-Z][a-z]+[A-Z]\w*")  # snake, kebab, digits or CamelCase
+
+
+def docs_namesake(ctx):
+    """A changed module's namesake doc beside it (engine_smoke.py and ENGINE_SMOKE.md) that names something the
+    diff changed, and did not change itself."""
+    changed = {f.path for f in ctx.files.values()} | {f.old_path for f in ctx.files.values()}
+    docs = defaultdict(list)
+    for p in ctx.live_files(".md"):
+        docs[(posixpath.dirname(p), posixpath.basename(p)[:-3].lower().replace("-", "_"))].append(p)
+    for f in ctx.changed(".py", tests=False):
+        key = (posixpath.dirname(f.path), posixpath.basename(f.path)[:-3].lower().replace("-", "_"))
+        base = (ctx.base_text(f.path) or "").splitlines()
+        touched = [l for _, l in ctx.added_text(f.path)] + [base[n - 1] for n in f.removed_old if 0 < n <= len(base)]
+        words = list(dict.fromkeys(m.group().strip(".-") for l in touched for m in WORD.finditer(l)
+                                   if len(m.group().strip(".-")) >= 5 and "/" not in l[max(m.start() - 1, 0):m.end() + 1]))
+        for doc in docs.get(key, []):
+            if doc in changed: continue
+            lines = ctx.lines(doc)
+            hits = [(w, next((i for i, l in enumerate(lines, 1) if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", l)), 1))
+                    for w in words if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", ctx.text(doc) or "")]
+            if hits:
+                named = ", ".join(f"`{w}` (:{n})" for w, n in hits[:3])
+                yield doc, hits[0][1], f"documents {f.path}, which this diff changes where it names {named}; {doc} did not change. Does it still hold?"
+
+
 def env_undocumented(ctx):
     docs = "\n".join(ctx.text(p) or "" for p in ctx.live if is_doc(p))
     for f in ctx.changed(".py", tests=False):
@@ -438,6 +464,37 @@ def dup_helpers(ctx):
         if best and (id(best[2]), id(fn)) not in reported:
             reported.add((id(fn), id(best[2])))
             yield path, fn.lineno, f"`{fn.name}` is a {best[0]:.0%} copy of `{best[2].name}` at {best[1]}:{best[2].lineno}; reuse it or say why not"
+
+
+PATHLIKE = re.compile(r"^[\w.-]+(?:/[\w.-]+)+\.\w{1,8}$")
+
+
+def path_constants(tree):
+    """(path, line) of each repo path a module-level UPPER constant holds directly or as a dict value; tuples and
+    lists of inputs are left out (tools list the files they hash on purpose)."""
+    for s in tree.body if tree else []:
+        if isinstance(s, (ast.Assign, ast.AnnAssign)) and any(isinstance(t, ast.Name) and t.id.isupper()
+                                                               for t in (s.targets if isinstance(s, ast.Assign) else [s.target])):
+            vals = [s.value] if isinstance(s.value, ast.Constant) else list(s.value.values) if isinstance(s.value, ast.Dict) else []
+            for v in vals:
+                if isinstance(v, ast.Constant) and isinstance(v.value, str) and len(v.value) >= 15 and PATHLIKE.match(v.value):
+                    yield v.value, v.lineno
+
+
+def dup_constants(ctx):
+    """A path constant this diff adds that another non-test module already defines: two definitions drift apart."""
+    new = [(f.path, v, line) for f in ctx.changed(".py", tests=False) for v, line in path_constants(ctx.tree(f.path)) if line in f.added]
+    if not new: return
+    wanted = {v for _, v, _ in new}
+    defined = defaultdict(list)
+    for p in ctx.live_files(".py", tests=False):
+        if not any(v in (ctx.text(p) or "") for v in wanted): continue
+        for v, line in path_constants(ctx.tree(p)):
+            if v in wanted: defined[v].append((p, line))
+    for path, v, line in new:
+        other = next(((p, n) for p, n in defined[v] if p != path), None)
+        if other:
+            yield path, line, f"`{v}` is also defined at {other[0]}:{other[1]}; define it once and import it, so the two cannot drift"
 
 
 def imports_private(ctx):
@@ -1205,6 +1262,30 @@ def py_isfinite(ctx):
                     yield f.path, n.lineno, f"`{call_name(n)}` converts ints to float and raises OverflowError past ~1e308 (10**400 in JSON); check `type(x) is float` first"
 
 
+def _fractional(v):
+    return type(v) is float and v == v and abs(v) != float("inf") and v != int(v)
+
+
+def py_float_threshold(ctx):
+    """An ordered comparison of a float ratio with a fractional threshold: the boundary case can land either side."""
+    for f, tree, par in _lint_files(ctx):
+        consts = {}
+        for s in tree.body:  # NAME = 0.97 and NAME, OTHER = 0.97, 31
+            for tgt in s.targets if isinstance(s, ast.Assign) else []:
+                pairs = zip(tgt.elts, s.value.elts) if isinstance(tgt, ast.Tuple) and isinstance(s.value, ast.Tuple) else [(tgt, s.value)]
+                consts.update({n.id: v.value for n, v in pairs if isinstance(n, ast.Name) and isinstance(v, ast.Constant)})
+        frac = lambda x: _fractional(x.value) if isinstance(x, ast.Constant) else isinstance(x, ast.Name) and _fractional(consts.get(x.id))
+        ratio = lambda x: (isinstance(x, ast.BinOp) and isinstance(x.op, ast.Div)) or bool(re.search(r"ratio|frac|share", ast.unparse(x), re.I))
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Compare) and n.lineno in f.added and len(n.ops) == 1
+                    and isinstance(n.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE))): continue
+            a, b = n.left, n.comparators[0]
+            if (frac(a) and ratio(b)) or (frac(b) and ratio(a)):
+                yield f.path, n.lineno, (f"`{ast.unparse(n)[:80]}` compares a float ratio with a threshold; (97/1016)/(100/1016) "
+                                         "is 0.96999…, so a ratio exactly on the boundary can fall on the wrong side. Compare "
+                                         "integer counts (Fraction(c * n_a, r * n_p) < Fraction(97, 100)) or state the tolerance")
+
+
 def py_sigalrm(ctx):
     for f, tree, par in _lint_files(ctx):
         threads = any((isinstance(n, ast.Attribute) and n.attr in ("Thread", "ThreadPoolExecutor")) or
@@ -1377,6 +1458,10 @@ PROMPTS = [
      "multi-line one included? is the directory the command runs in used (the tool's workdir field, `cd`, `git -C`)? "
      "do explicit selectors (a PR number, --repo, --head, a push refspec) choose what is checked, not the current "
      "branch? can an earlier command of the same call (a commit, a checkout) change what gets sent?"),
+    ("prompt.references", r"normpath|relpath|\.resolve\(\)|PurePosixPath|#L\d|\bcit(?:e|es|ation)\b|line_?refs?|\branges\b|\binterval",
+     "code that resolves paths or line references changed: does a relative mention (`./x`, `../x`) resolve the same as "
+     "its normalized form, looked up in the same set of files? is a range (`3-8`, `#L3-L8`) checked over every line "
+     "inside it, not only its ends? do comma lists stay separate points?"),
     ("prompt.external-sdk", r"\bmodal\.|boto3|httpx|requests\.|\[\s*['\"](modal|gh|kubectl|aws|terraform)['\"]",
      "external SDK or CLI use changed: was it exercised against the real library offline (its resolver, the argv the real tool produces), "
      "not only a recording fake that accepts any call order?"),
@@ -1451,9 +1536,11 @@ CHECKS = [
     Check("refs.callers", "fast", "block", "PR 80 r3", "call sites that no longer match a changed signature, ci-only dirs included", refs_callers),
     Check("refs.orphan", "fast", "warn", "PR 59, 62, 76", "a new lock or module nothing references; new code only tests call", refs_orphan),
     Check("docs.cochange", "fast", "ask", "PR 52, 54, 55, 76 ⇢", "a doc that historically changes with a changed file but did not change", docs_cochange),
+    Check("docs.namesake", "fast", "ask", "PR 116", "a module's namesake doc beside it that names what the diff changed and did not change", docs_namesake),
     Check("env.undocumented", "fast", "warn", "PR 51, 52", "a newly read env var that no doc names", env_undocumented),
     Check("pins.drift", "fast", "warn", "PR 59, 76 ⇢", "a package pinned at different versions across requirements, workflows, images and docs", pins_drift),
     Check("dup.helpers", "fast", "warn", "PR 31, 54, 56, 59, 69", "a new function that near-copies an existing one under another name; hand-rolled hashing", dup_helpers),
+    Check("dup.constants", "fast", "warn", "PR 116", "a new path constant another non-test module already defines", dup_constants),
     Check("imports.private", "fast", "warn", "PR 62, 67, 73, 76", "private names imported across modules; tests importing other test modules", imports_private),
     Check("cite.resolve", "fast", "warn", "PR 84, 67, 74", "path:line citations in changed text that do not resolve, are ambiguous or out of range", cite_resolve),
     Check("cite.drift", "fast", "warn", "PR 31, 85 r1", "citations into changed files whose lines moved or changed, here or when the base merges", cite_drift),
@@ -1471,6 +1558,7 @@ CHECKS = [
     Check("py.modal-image-order", "fast", "block", "PR 88", "a modal.Image build step after a deferred add_local_* (Modal refuses the image)", py_modal_image_order),
     Check("py.json-recursion", "fast", "warn", "PR 68, 69", "json parsing guarded only by ValueError (RecursionError escapes)", py_json_recursion),
     Check("py.isfinite-int", "fast", "warn", "PR 84, 85", "math.isfinite/isnan on values that may be huge ints (OverflowError)", py_isfinite),
+    Check("py.float-threshold", "fast", "warn", "PR 99", "a float ratio compared with a fractional threshold (boundary cases flip)", py_float_threshold),
     Check("py.kill-eperm", "fast", "warn", "PR 75 ⇢", "kill/killpg guarded only by ProcessLookupError (PermissionError on a zombie leader)", py_kill_eperm),
     Check("py.importerror", "fast", "warn", "PR 54", "`except ImportError` around an optional import (hides broken installs)", py_importerror),
     Check("py.sigalrm-threads", "fast", "warn", "PR 80 r2", "SIGALRM timers in a module that runs threads or executors", py_sigalrm),
