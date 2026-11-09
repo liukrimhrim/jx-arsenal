@@ -14,6 +14,8 @@ Scope: the diff is merge-base(--base, HEAD) against the working tree, plus untra
 set": tracked and untracked files minus `frozen_lists` (sha256 manifests whose files never change) and `excludes`.
 The fast tier is static. --full adds test collection, a fix-removal run (changed tests against base code) and mutation
 of changed lines (--budget seconds), each in temporary `git worktree`s that are removed afterwards.
+Receipts: every run writes <git-common-dir>/preflight/<HEAD>.<fast|full>.json (head, dirty, partial, the open blocks
+and asks with their ids), so a hook or a reviewer can ask whether this exact commit passed without rerunning it.
 Dispositions: a ledger line `- <id> <reason>` (the run writes a template to OUT/ledger.md; pass it back with --ledger),
 or a standing line `- <check-glob> <path-glob>: <reason>` in the repo's dispositions file. A disposed finding never fails
 the run. Repo config: `.jx/preflight.json` (frozen_lists, excludes, governing_docs, test_commands, test_python,
@@ -126,8 +128,11 @@ class Change:
         self.base = args.base
         self._text, self._base, self._ast, self._base_ast = {}, {}, {}, {}
         if self.base.startswith("origin/"):
-            p = run(["git", "-C", str(root), "fetch", "-q", "origin", self.base[7:]], check=False, timeout=60)
-            if p.returncode: print(f"preflight: fetch of {self.base} failed; using the local ref", file=sys.stderr)
+            try:
+                failed = run(["git", "-C", str(root), "fetch", "-q", "origin", self.base[7:]], check=False, timeout=60).returncode
+            except RuntimeError:  # timed out: offline, or the remote is unreachable
+                failed = True
+            if failed: print(f"preflight: fetch of {self.base} failed; using the local ref", file=sys.stderr)
         self.base_tip = git(root, "rev-parse", "--verify", f"{self.base}^{{commit}}").strip()
         self.head = git(root, "rev-parse", "HEAD").strip()
         self.merge_base = git(root, "merge-base", self.base_tip, "HEAD").strip()
@@ -418,7 +423,24 @@ def cmd_run(a):
           f"report in {out}", file=sys.stderr)
     if open_blocks or open_asks:
         print(f"next: fix each block, then dispose the rest in {out / 'ledger.md'} and rerun with --ledger {out / 'ledger.md'}", file=sys.stderr)
-    return 1 if open_blocks or (a.strict and open_asks) else 0
+    code = 1 if open_blocks or (a.strict and open_asks) else 0
+    write_receipt(ctx, a, unique, code, out)
+    return code
+
+
+def write_receipt(ctx, a, unique, code, out):
+    """Record this run for HEAD so a gate (a PR-creation hook) can check it without rerunning; return the path."""
+    common = Path(git(ctx.root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    d = common / "preflight"; d.mkdir(parents=True, exist_ok=True)
+    tier = "full" if a.full else "fast"
+    rec = dict(head=ctx.head, dirty=ctx.dirty, tier=tier, runner="jx", partial=bool(a.only or a.skip), base=ctx.base,
+               merge_base=ctx.merge_base, created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), exit=code, out=str(out),
+               open=[dict(id=f.id, check=f.check, severity=f.severity, path=f.path, line=f.line, message=f.message)
+                     for f in unique if f.severity in ("block", "ask") and not f.disposition],
+               counts={s: sum(f.severity == s for f in unique) for s in SEVERITIES})
+    path = d / f"{ctx.head}.{tier}.json"
+    path.write_text(json.dumps(rec, indent=1))
+    return path
 
 
 def cmd_ls(a):

@@ -86,8 +86,22 @@ def tests_collect(ctx):
         except subprocess.TimeoutExpired:
             yield "", "", f"`{raw}` did not finish collecting in 900 s", "warn"; continue
         if p.returncode not in (0, 5):
-            errs = [l for l in (p.stdout + p.stderr).splitlines() if re.match(r"^(ERROR|E\s|ImportError|ModuleNotFoundError)", l)][:3]
-            yield "", "", f"`{raw}` fails to collect (exit {p.returncode}): {' | '.join(errs) or (p.stdout + p.stderr).strip()[-300:]}", "block"
+            text = p.stdout + p.stderr
+            errs = [l for l in text.splitlines() if re.match(r"^(ERROR|E\s|ImportError|ModuleNotFoundError)", l)]
+            failing = set(re.findall(r"^ERROR (\S+)", text, re.M))
+            missing = set(re.findall(r"No module named '([\w.]+)'", text))
+            third_party = {m for m in missing if not _in_repo(ctx.root, m)}
+            if failing and third_party and len(failing) <= len(re.findall(r"No module named '(?:" + "|".join(map(re.escape, third_party)) + r")'", text)):
+                yield "", "", (f"`{raw}`: {len(failing)} test file(s) cannot be collected because the test python lacks "
+                               f"{', '.join(sorted(third_party))} (not a module of this repo); install it into test_python"), "warn"
+                continue
+            yield "", "", f"`{raw}` fails to collect (exit {p.returncode}): {' | '.join(errs[:3]) or text.strip()[-300:]}", "block"
+
+
+def _in_repo(root, module):
+    """Whether a missing module is this repository's own (a broken import, not a missing dependency)."""
+    top = module.split(".")[0]
+    return (root / top).is_dir() or (root / f"{top}.py").is_file() or any(root.glob(f"*/{top}/__init__.py"))
 
 
 def _changed_test_functions(ctx, f):

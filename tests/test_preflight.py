@@ -179,6 +179,19 @@ class TestChecks(Base):
         code, rows, _ = r.run("--only", "tests.ci-diff")
         self.assertEqual((code, [x["path"] for x in rows]), (1, ["tests/test_b.py"]))
 
+    def test_spec_ledger_topics(self):
+        doc = "# Plan\n\n## Timing bars\n\n- report step ms per level\n\n## Other\n\n- speed must be paired\n- settings must restore X\n"
+        r = self.repo({"PLAN.md": doc, ".jx/preflight.json": json.dumps({"governing_docs": ["PLAN.md"]})})
+        r.commit({"timing_reader.py": "x = 1\n", "settings.json": "{}\n"})
+        self.assertEqual([x["line"] for x in r.run("--only", "spec.ledger")[1]], [5])
+        self.assertEqual(sorted(x["line"] for x in r.run("--only", "spec.ledger", "--topic", "speed")[1]), [5, 9])
+
+    def test_a_test_file_run_directly_counts_as_ci(self):
+        wf = "on: pull_request\njobs:\n  t:\n    steps:\n      - run: |\n          python3 .jx/test_gate.py\n          python -m unittest tests/test_u.py\n"
+        r = self.repo({".github/workflows/ci.yml": wf, "a.py": "x = 1\n"})
+        r.commit({".jx/test_gate.py": "import unittest\n", "tests/test_u.py": "import unittest\n", "tests/test_v.py": "import unittest\n"})
+        self.assertEqual([x["path"] for x in r.run("--only", "tests.ci")[1]], ["tests/test_v.py"])
+
     def test_patch_targets_skips_and_vacuous_asserts(self):
         r = self.repo({"app.py": "FLAG = 1\ndef run():\n    return FLAG\n", "tests/helpers.py": "def check_ok(x):\n    assert x\n"})
         r.commit({"tests/test_app.py": """
@@ -277,6 +290,25 @@ class HygieneAndRunnerTests(Base):
         code, rows, _ = r.run("--only", "pack.bad")
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
+    def test_receipt_records_head_tier_and_open_items(self):
+        r = self.repo({"a.py": "x = 1\n", ".jx/pack.py": 'print("pack.q\\task\\ta.py\\t1\\tanswer me\\tPR 1")\n',
+                       ".jx/preflight.json": json.dumps({"checks": [{"id": "pack.q", "cmd": "python3 .jx/pack.py"}]})})
+        r.commit({"a.py": "x = 2\n"})
+        code, rows, _ = r.run("--only", "pack.q")
+        rec = json.loads((r.path / ".git" / "preflight" / f"{r.git('rev-parse', 'HEAD')}.fast.json").read_text())
+        self.assertEqual((code, rec["tier"], rec["dirty"], rec["partial"]), (0, "fast", False, True))
+        self.assertEqual([x["id"] for x in rec["open"]], [rows[0]["id"]])
+
+    def test_unreachable_remote_falls_back_to_the_local_base(self):
+        r = self.repo({"a.py": "x = 1\n"})
+        r.git("remote", "add", "origin", "/nonexistent/remote.git")
+        r.git("update-ref", "refs/remotes/origin/main", r.git("rev-parse", "main"))
+        r.commit({"a.py": "x = 2\n"})
+        p = subprocess.run([sys.executable, str(JX), "preflight", "run", "--base", "origin/main", "--only", "refs.removed", "--json"],
+                           cwd=r.path, text=True, capture_output=True)
+        self.assertEqual((p.returncode, json.loads(p.stdout)), (0, []))
+        self.assertIn("using the local ref", p.stderr)
+
     def test_dry_run_and_ls(self):
         r = self.repo({"a.py": "x = 1\n"})
         p = subprocess.run([sys.executable, str(JX), "preflight", "run", "--base", "main", "--dry-run"], cwd=r.path, text=True, capture_output=True)
@@ -319,7 +351,10 @@ class DynamicTests(Base):
                   "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\ndef test_negative():\n    assert ok(-1) == 0\ndef test_still_one():\n    assert ok(2) == 2\n"})
         rows = r.run("--full", "--only", "tests.fix-removal")[1]
         self.assertEqual([x["line"] for x in rows], [6])
-        r.commit({"tests/test_broken.py": "import does_not_exist\n"})
+        r.commit({"tests/test_missing_dep.py": "import some_absent_dependency\n"})
+        code, rows, _ = r.run("--full", "--only", "tests.collect")
+        self.assertEqual((code, rows[0]["severity"]), (0, "warn"))
+        r.commit({"pkg/__init__.py": "", "tests/test_broken.py": "import pkg.gone\n"})
         code, rows, _ = r.run("--full", "--only", "tests.collect")
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
