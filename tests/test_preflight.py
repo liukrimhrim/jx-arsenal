@@ -254,6 +254,19 @@ class LintTests(Base):
         got = sorted((x["check"], x["line"]) for x in rows)
         self.assertEqual(got, [("py.isfinite-int", 8), ("py.json-recursion", 4), ("py.json-subscript", 18), ("py.kill-eperm", 11), ("py.timeout-unhandled", 15)])
 
+    def test_a_command_gate_change_asks_the_gate_checklist(self):
+        r = self.repo({"hook.py": "import json\n"})
+        r.commit({"hook.py": """
+            import json, shlex, sys
+            event = json.load(sys.stdin)
+            words = shlex.split(event["tool_input"]["command"])
+            """})
+        _, rows, _ = r.run()
+        self.assertTrue([x for x in self.hits(rows, "prompts", "ask", "hook.py") if "[prompt.command-gate]" in x["message"]])
+        r.commit({"hook.py": "import json\nprint(json.loads('{}'))\n"})
+        _, rows, _ = r.run()
+        self.assertFalse([x for x in rows if "[prompt.command-gate]" in x["message"]])
+
     def test_a_fix_sweeps_the_same_pattern_elsewhere(self):
         bad = "import os\ndef stop(pid):\n    try:\n        os.killpg(pid, 9)\n    except ProcessLookupError:\n        pass\n"
         r = self.repo({"a.py": bad, "b.py": bad})
