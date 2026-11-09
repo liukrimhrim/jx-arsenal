@@ -18,6 +18,7 @@ name the command that lists valid ids. Anything that posts or triggers has `--dr
 jx review 1234 --out /tmp/pr1234              # source/diff + full feedback, including inline comments
 jx review 1234 --check-only --previous /tmp/pr1234/snapshot.json --out /tmp/pr1234-next
 jx check run --junit junit.xml -- python -m pytest tests --junitxml '{out}/junit.xml'
+jx preflight run --full --body draft.md       # before opening a PR: findings TSV; fix blocks, dispose asks in the ledger it writes
 jx pr triage 1234 --wait                       # wait for checks, then failed-job log lines for every failing run
 jx pr ci 1234 --failed | jx ci failed -        # same thing as two composable steps; `-` reads run_id from stdin
 jx pr show 84 85 86                            # state, head sha, mergeable, check counts, unresolved threads: one row per PR
