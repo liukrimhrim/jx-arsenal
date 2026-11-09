@@ -128,8 +128,11 @@ class Change:
         self.base = args.base
         self._text, self._base, self._ast, self._base_ast = {}, {}, {}, {}
         if self.base.startswith("origin/"):
-            p = run(["git", "-C", str(root), "fetch", "-q", "origin", self.base[7:]], check=False, timeout=60)
-            if p.returncode: print(f"preflight: fetch of {self.base} failed; using the local ref", file=sys.stderr)
+            try:
+                failed = run(["git", "-C", str(root), "fetch", "-q", "origin", self.base[7:]], check=False, timeout=60).returncode
+            except RuntimeError:  # timed out: offline, or the remote is unreachable
+                failed = True
+            if failed: print(f"preflight: fetch of {self.base} failed; using the local ref", file=sys.stderr)
         self.base_tip = git(root, "rev-parse", "--verify", f"{self.base}^{{commit}}").strip()
         self.head = git(root, "rev-parse", "HEAD").strip()
         self.merge_base = git(root, "merge-base", self.base_tip, "HEAD").strip()

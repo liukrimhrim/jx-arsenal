@@ -299,6 +299,16 @@ class HygieneAndRunnerTests(Base):
         self.assertEqual((code, rec["tier"], rec["dirty"], rec["partial"]), (0, "fast", False, True))
         self.assertEqual([x["id"] for x in rec["open"]], [rows[0]["id"]])
 
+    def test_unreachable_remote_falls_back_to_the_local_base(self):
+        r = self.repo({"a.py": "x = 1\n"})
+        r.git("remote", "add", "origin", "/nonexistent/remote.git")
+        r.git("update-ref", "refs/remotes/origin/main", r.git("rev-parse", "main"))
+        r.commit({"a.py": "x = 2\n"})
+        p = subprocess.run([sys.executable, str(JX), "preflight", "run", "--base", "origin/main", "--only", "refs.removed", "--json"],
+                           cwd=r.path, text=True, capture_output=True)
+        self.assertEqual((p.returncode, json.loads(p.stdout)), (0, []))
+        self.assertIn("using the local ref", p.stderr)
+
     def test_dry_run_and_ls(self):
         r = self.repo({"a.py": "x = 1\n"})
         p = subprocess.run([sys.executable, str(JX), "preflight", "run", "--base", "main", "--dry-run"], cwd=r.path, text=True, capture_output=True)
