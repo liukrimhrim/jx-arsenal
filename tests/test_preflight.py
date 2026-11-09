@@ -92,13 +92,14 @@ class ReachTests(Base):
 
     def test_namesake_doc_naming_what_changed_asks(self):
         base = {"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16",)\n', "pkg/other.py": "X = 1\n",
-                "pkg/ENGINE_SMOKE.md": "# Engine smoke\n\nArms: `stock-w4a16` and `optimized-d2b`.\n"}
+                "pkg/ENGINE_SMOKE.md": "# Engine smoke\n\nArms: `stock-w4a16` and `optimized-d2b`, maps under pkg_dir.\n"}
         r = self.repo(base)
-        r.commit({"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16", "optimized-d2b")\nPIN = {"optimized-d2b": "x"}\n'})
+        r.commit({"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16", "optimized-d2b")\nPIN = {"optimized-d2b": "pkg_dir/x.json"}\n'})
         _, rows, _ = r.run()
         hits = self.hits(rows, "docs.namesake", "ask", "pkg/ENGINE_SMOKE.md")
         self.assertEqual([x["line"] for x in hits], [3])
         self.assertIn("`optimized-d2b`", hits[0]["message"])
+        self.assertNotIn("pkg_dir", hits[0]["message"])  # a path segment is not a name the doc documents
         r = self.repo(base)
         r.commit({"pkg/engine_smoke.py": 'ARMS = ("stock-w4a16",)\nTIMEOUT_S = 5\n', "pkg/other.py": "X = 2\n"})
         _, rows, _ = r.run()
@@ -281,17 +282,19 @@ class LintTests(Base):
         r = self.repo({"gate.py": "TILT_MIN = 0.97\n"})
         r.commit({"gate.py": """
             TILT_MIN = 0.97
+            TAU_MIN, TAU_K = 0.99, 31
 
 
-            def tilt(c, r, n_p, n_a):
-                return (c / n_p) / (r / n_a) < TILT_MIN
+            def tilt(c, r, n_p, n_a, p):
+                return (c / n_p) / (r / n_a) < TILT_MIN or p["ratio"] < TAU_MIN
 
 
             def small(n, ratio):
                 return n < 0.5 or ratio >= 1.0
             """})
         _, rows, _ = r.run()
-        self.assertEqual([(x["path"], x["line"]) for x in self.hits(rows, "py.float-threshold", "warn")], [("gate.py", 5)])
+        self.assertEqual([(x["path"], x["line"]) for x in self.hits(rows, "py.float-threshold", "warn")],
+                         [("gate.py", 6), ("gate.py", 6)])
 
     def test_path_and_range_code_asks_the_references_checklist(self):
         r = self.repo({"refs.py": "import os\n"})

@@ -369,7 +369,8 @@ def docs_namesake(ctx):
         key = (posixpath.dirname(f.path), posixpath.basename(f.path)[:-3].lower().replace("-", "_"))
         base = (ctx.base_text(f.path) or "").splitlines()
         touched = [l for _, l in ctx.added_text(f.path)] + [base[n - 1] for n in f.removed_old if 0 < n <= len(base)]
-        words = list(dict.fromkeys(w.strip(".-") for l in touched for w in WORD.findall(l) if len(w.strip(".-")) >= 5))
+        words = list(dict.fromkeys(m.group().strip(".-") for l in touched for m in WORD.finditer(l)
+                                   if len(m.group().strip(".-")) >= 5 and "/" not in l[max(m.start() - 1, 0):m.end() + 1]))
         for doc in docs.get(key, []):
             if doc in changed: continue
             lines = ctx.lines(doc)
@@ -1268,8 +1269,11 @@ def _fractional(v):
 def py_float_threshold(ctx):
     """An ordered comparison of a float ratio with a fractional threshold: the boundary case can land either side."""
     for f, tree, par in _lint_files(ctx):
-        consts = {t.id: s.value.value for s in tree.body if isinstance(s, ast.Assign) and isinstance(s.value, ast.Constant)
-                  for t in s.targets if isinstance(t, ast.Name)}
+        consts = {}
+        for s in tree.body:  # NAME = 0.97 and NAME, OTHER = 0.97, 31
+            for tgt in s.targets if isinstance(s, ast.Assign) else []:
+                pairs = zip(tgt.elts, s.value.elts) if isinstance(tgt, ast.Tuple) and isinstance(s.value, ast.Tuple) else [(tgt, s.value)]
+                consts.update({n.id: v.value for n, v in pairs if isinstance(n, ast.Name) and isinstance(v, ast.Constant)})
         frac = lambda x: _fractional(x.value) if isinstance(x, ast.Constant) else isinstance(x, ast.Name) and _fractional(consts.get(x.id))
         ratio = lambda x: (isinstance(x, ast.BinOp) and isinstance(x.op, ast.Div)) or bool(re.search(r"ratio|frac|share", ast.unparse(x), re.I))
         for n in ast.walk(tree):
