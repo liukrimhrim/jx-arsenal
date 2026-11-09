@@ -179,6 +179,19 @@ class TestChecks(Base):
         code, rows, _ = r.run("--only", "tests.ci-diff")
         self.assertEqual((code, [x["path"] for x in rows]), (1, ["tests/test_b.py"]))
 
+    def test_spec_ledger_topics(self):
+        doc = "# Plan\n\n## Timing bars\n\n- report step ms per level\n\n## Other\n\n- speed must be paired\n- settings must restore X\n"
+        r = self.repo({"PLAN.md": doc, ".jx/preflight.json": json.dumps({"governing_docs": ["PLAN.md"]})})
+        r.commit({"timing_reader.py": "x = 1\n", "settings.json": "{}\n"})
+        self.assertEqual([x["line"] for x in r.run("--only", "spec.ledger")[1]], [5])
+        self.assertEqual(sorted(x["line"] for x in r.run("--only", "spec.ledger", "--topic", "speed")[1]), [5, 9])
+
+    def test_a_test_file_run_directly_counts_as_ci(self):
+        wf = "on: pull_request\njobs:\n  t:\n    steps:\n      - run: |\n          python3 .jx/test_gate.py\n          python -m unittest tests/test_u.py\n"
+        r = self.repo({".github/workflows/ci.yml": wf, "a.py": "x = 1\n"})
+        r.commit({".jx/test_gate.py": "import unittest\n", "tests/test_u.py": "import unittest\n", "tests/test_v.py": "import unittest\n"})
+        self.assertEqual([x["path"] for x in r.run("--only", "tests.ci")[1]], ["tests/test_v.py"])
+
     def test_patch_targets_skips_and_vacuous_asserts(self):
         r = self.repo({"app.py": "FLAG = 1\ndef run():\n    return FLAG\n", "tests/helpers.py": "def check_ok(x):\n    assert x\n"})
         r.commit({"tests/test_app.py": """

@@ -825,9 +825,15 @@ VALUE_OPTS = {"-k", "-m", "-p", "-c", "-o", "--basetemp", "--junitxml", "--rootd
 
 
 def pytest_invocations(cmd):
-    """(mode, paths, ignores) for each pytest command in a shell script; mode is run, partial or collect."""
+    """(mode, paths, ignores) for each test command in a shell script: pytest (run, partial or collect), and a test
+    file run directly or through `-m unittest`, which runs it whole."""
     text = re.sub(r"\\\n\s*", " ", cmd)
     for seg in re.split(r"\n|;|&&|\|\|", text):
+        direct = re.findall(r"(?:^|\s)python[\d.]*\s+(?:-\S+\s+)*([\w./-]*test_\w+\.py)\b", seg)
+        unit = re.search(r"-m\s+unittest\b(.*)", seg)
+        if direct or unit:
+            yield "run", direct + ([t for t in unit.group(1).split() if not t.startswith("-")] if unit else []), []
+            continue
         if not re.search(r"(^|[\s/])pytest(\s|$)", seg): continue
         toks = seg.replace("'", " ").replace('"', " ").split()
         i = next(k for k, t in enumerate(toks) if t.endswith("pytest"))
@@ -1401,14 +1407,17 @@ def spec_ledger(ctx):
     docs = [d for d in ctx.config.get("governing_docs") or [] if (ctx.root / d).is_file()]
     if not docs: return
     topics = {t.lower() for t in ctx.args.topic or []}
+    explicit = set(topics)
     for f in ctx.changed(statuses="A"):
-        topics |= {t for t in re.split(r"[_\-.]", stem(f.path).lower()) if len(t) >= 4 and t not in GENERIC}
+        if f.path.endswith((".py", ".md")) and not ctx.is_test(f.path):
+            topics |= {t for t in re.split(r"[_\-.]", stem(f.path).lower()) if len(t) >= 4 and t not in GENERIC}
     auto = {t for t in topics if t not in {x.lower() for x in ctx.args.topic or []}}
     if auto:
         text = "\n".join(ctx.text(d) or "" for d in docs).lower()
         topics -= {t for t in auto if len(re.findall(rf"\b{re.escape(t)}\b", text)) > 12}  # too common to point at one requirement
     if not topics: return
     trx = re.compile(r"(?i)\b(" + "|".join(re.escape(t) for t in sorted(topics, key=len, reverse=True)) + r")\b")
+    erx = re.compile(r"(?i)\b(" + "|".join(re.escape(t) for t in sorted(explicit, key=len, reverse=True)) + r")\b") if explicit else None
     out = []
     for d in docs:
         if d in {f.path for f in ctx.files.values()}: continue
@@ -1421,7 +1430,7 @@ def spec_ledger(ctx):
                 if trx.search(m[2]): heading_hit, level = True, lv
                 continue
             item = re.match(r"^\s*(?:[-*+]|\d+[.)]|\|)\s+\S", line)
-            if (heading_hit and item) or (trx.search(line) and REQ.search(line)):
+            if (heading_hit and item) or (erx and erx.search(line) and REQ.search(line)):
                 out.append((0 if heading_hit else 1, d, i, line.strip()))
     out.sort()
     for _, d, i, line in out[:25]:
