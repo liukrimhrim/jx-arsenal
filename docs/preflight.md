@@ -30,7 +30,7 @@ jx preflight ls | jx preflight doctor
 - **block**: a definite defect. A call that no longer matches a changed signature, a Modal image that Modal
   refuses, a credential, a test file CI stopped running, a citation past the end of a file.
 - **warn**: a likely defect, so look at it.
-- **ask**: a question only the author can answer. A checklist for a lifecycle, credential, parser or SDK change.
+- **ask**: a question only the author can answer. A checklist for a lifecycle, credential, parser, command-gate or SDK change.
   A governing-doc requirement. A workflow change the body never mentions.
 - **info**: a summary, such as the mutation score.
 

@@ -1371,6 +1371,12 @@ PROMPTS = [
     ("prompt.parser", r"json\.loads?\(|splitlines\(|re\.(match|search|finditer|fullmatch)\(|\.split\(",
      "parser of external input changed: what do deep nesting, huge ints, NaN/Infinity, BOM, CRLF, invalid UTF-8, truncation and duplicates do? "
      "does a contradiction still fail when another part is missing (fail outranks pending)?"),
+    ("prompt.command-gate", r"PreToolUse|permissionDecision|tool_input|shlex\.(split|shlex)\(",
+     "code that allows or refuses shell commands changed: is every command of a call checked (`;`, `&&`, `||`, `|`, "
+     "subshells, `sh -c`, each call of a wrapper), not only the first match? does a quoted argument stay whole, a "
+     "multi-line one included? is the directory the command runs in used (the tool's workdir field, `cd`, `git -C`)? "
+     "do explicit selectors (a PR number, --repo, --head, a push refspec) choose what is checked, not the current "
+     "branch? can an earlier command of the same call (a commit, a checkout) change what gets sent?"),
     ("prompt.external-sdk", r"\bmodal\.|boto3|httpx|requests\.|\[\s*['\"](modal|gh|kubectl|aws|terraform)['\"]",
      "external SDK or CLI use changed: was it exercised against the real library offline (its resolver, the argv the real tool produces), "
      "not only a recording fake that accepts any call order?"),
