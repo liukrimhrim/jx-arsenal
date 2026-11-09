@@ -341,7 +341,10 @@ class DynamicTests(Base):
                   "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\ndef test_negative():\n    assert ok(-1) == 0\ndef test_still_one():\n    assert ok(2) == 2\n"})
         rows = r.run("--full", "--only", "tests.fix-removal")[1]
         self.assertEqual([x["line"] for x in rows], [6])
-        r.commit({"tests/test_broken.py": "import does_not_exist\n"})
+        r.commit({"tests/test_missing_dep.py": "import some_absent_dependency\n"})
+        code, rows, _ = r.run("--full", "--only", "tests.collect")
+        self.assertEqual((code, rows[0]["severity"]), (0, "warn"))
+        r.commit({"pkg/__init__.py": "", "tests/test_broken.py": "import pkg.gone\n"})
         code, rows, _ = r.run("--full", "--only", "tests.collect")
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
