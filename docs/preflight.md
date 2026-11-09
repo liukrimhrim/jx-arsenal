@@ -55,7 +55,7 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
   - **Mutation** splices one node's exact byte range per mutant, so file-hash tests stay meaningful. It first
     runs a no-op control mutant: tests that fail on the control (hash-pinned files) don't count as kills.
     Timeouts count as unknown. `--budget` bounds the run.
-  - **Fix-removal** reverts the non-test changes and reports changed tests that still pass.
+  - **Fix-removal** reverts the non-test changes and reports changed tests that still pass. A parametrized test counts as one test: it is reported only when none of its cases fails.
 
 ## Repo config: `.jx/preflight.json`
 
