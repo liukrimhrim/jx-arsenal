@@ -361,9 +361,11 @@ class DynamicTests(Base):
         r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",
                        ".jx/preflight.json": self.config()})
         r.commit({"calc.py": "def ok(x):\n    return x if x >= 0 else 0\n",
-                  "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\ndef test_negative():\n    assert ok(-1) == 0\ndef test_still_one():\n    assert ok(2) == 2\n"})
+                  "tests/test_calc.py": "import pytest\nfrom calc import ok\ndef test_ok():\n    assert ok(1) == 1\ndef test_negative():\n    assert ok(-1) == 0\ndef test_still_one():\n    assert ok(2) == 2\n"
+                                        "@pytest.mark.parametrize('x,y', [(1, 1), (-1, 0)])\ndef test_cases_one_catches(x, y):\n    assert ok(x) == y\n"
+                                        "@pytest.mark.parametrize('x', [1, 2])\ndef test_cases_none_catch(x):\n    assert ok(x) == x\n"})
         rows = r.run("--full", "--only", "tests.fix-removal")[1]
-        self.assertEqual([x["line"] for x in rows], [6])
+        self.assertEqual([x["line"] for x in rows], [7, 13])
         r.commit({"tests/test_missing_dep.py": "import some_absent_dependency\n"})
         code, rows, _ = r.run("--full", "--only", "tests.collect")
         self.assertEqual((code, rows[0]["severity"]), (0, "warn"))

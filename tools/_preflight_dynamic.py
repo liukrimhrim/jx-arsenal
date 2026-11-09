@@ -132,11 +132,14 @@ def tests_fix_removal(ctx):
                 if p.returncode == 0:
                     (d / f.old_path).parent.mkdir(parents=True, exist_ok=True); (d / f.old_path).write_bytes(p.stdout)
         status, cases, _, _ = pytest(ctx, d, [f.path for f in tests if fns[f.path]], timeout=1800)
+        states = {}  # (path, function) -> results of all its cases; a parametrized test is caught if any case fails
         for key, st in cases.items():
-            if st != "pass": continue
             path = _case_file(key, list(fns))
             name = key.split("::")[-1].split("[")[0]
             if path and name in fns[path]:
+                states.setdefault((path, name), set()).add(st)
+        for (path, name), seen in states.items():
+            if "pass" in seen and "fail" not in seen:
                 yield path, fns[path][name], f"`{name}` still passes with this diff's non-test changes reverted; it does not detect the change"
     finally:
         drop(ctx, d)
