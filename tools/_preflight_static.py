@@ -914,20 +914,33 @@ def _subst(s, entry, env):
 VALUE_OPTS = {"-k", "-m", "-p", "-c", "-o", "--basetemp", "--junitxml", "--rootdir", "--deselect", "--confcutdir", "-n", "--maxfail", "--durations", "--tb", "-W", "--timeout", "--log-level", "--cov", "--cov-report", "--cov-config"}
 
 
+SHELL_PIECE = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*"|\\.|&&|\|\||[;|\n]|[^'"\\;|&\n]+|.""", re.S)
+
+
+def shell_commands(text):
+    """The commands of a shell script: split at `;`, `&&`, `||`, `|` and newlines that stand outside quotes."""
+    cur = []
+    for m in SHELL_PIECE.finditer(text):
+        if m.group() in ("&&", "||", ";", "|", "\n"): yield "".join(cur); cur = []
+        else: cur.append(m.group())
+    yield "".join(cur)
+
+
 def pytest_invocations(cmd):
     """(mode, paths, ignores) for each test command in a shell script: pytest (run, partial or collect), and a test
     file run directly or through `-m unittest`, which runs it whole."""
     text = re.sub(r"\\\n\s*", " ", cmd)
-    for seg in re.split(r"\n|;|&&|\|\|?", text):  # a pipe ends the command too: `pytest -q | tee log`
+    for seg in shell_commands(text):  # a pipe ends the command too: `pytest -q | tee log`; a quoted `|` or `;` does not
         direct = re.findall(r"(?:^|\s)python[\d.]*\s+(?:-\S+\s+)*([\w./-]*test_\w+\.py)\b", seg)
         unit = re.search(r"-m\s+unittest\b(.*)", seg)
         if direct or unit:
             yield "run", direct + ([t for t in unit.group(1).split() if not t.startswith("-")] if unit else []), []
             continue
-        if not re.search(r"(^|[\s/])pytest(\s|$)", seg) or re.search(r"\binstall\b.*\bpytest\b", seg): continue  # `pip install pytest` runs nothing
+        if not re.search(r"(^|[\s/])pytest(\s|$)", seg): continue
         try: toks = shlex.split(seg)  # `-m "not slow"` is one value, not a path named slow
         except ValueError: toks = seg.replace("'", " ").replace('"', " ").split()
-        i = next(k for k, t in enumerate(toks) if t.endswith("pytest"))
+        i = next((k for k, t in enumerate(toks) if t.endswith("pytest")), None)
+        if i is None or "install" in toks[:i]: continue  # `echo "Run pytest tests/"` names it inside one word; `pip install pytest` runs nothing
         args, paths, ignores, mode, skipnext = toks[i + 1:], [], [], "run", False
         for k, t in enumerate(args):
             if skipnext: skipnext = False; continue
