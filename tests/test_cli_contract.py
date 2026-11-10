@@ -144,5 +144,14 @@ class FanOut(unittest.TestCase):
         self.assertEqual((seen, code), (["a"], 143))
 
 
+class RolloutTimeout(unittest.TestCase):
+    def test_every_duration_kubectl_accepts_is_read(self):
+        k = load("k")
+        for text, want in (("300s", 300), ("1m30s", 90), ("1.5m", 90), (".5h", 1800), ("1.h", 3600), ("+1m", 60), ("90000000us", 90), ("1500ms", 1.5),
+                           ("0", 0), ("0s", 0), ("5", None), ("abc", None), ("-1m", None), ("1m 30s", None), ("", None)):
+            got = k.go_seconds(text)
+            self.assertEqual(got if got is None else round(got, 6), want, text)
+
+
 if __name__ == "__main__":
     unittest.main()

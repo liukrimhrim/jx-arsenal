@@ -191,12 +191,15 @@ def cmd_logs(args):
         last = hi - 1
     sys.stderr.write(f"{len(hits)} hits in {len(lines)} lines\n")
 
+GO_UNIT = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "μs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}
+GO_PART = r"(\d+\.?\d*|\.\d+)(ns|us|µs|μs|ms|[smh])"
+
 def go_seconds(s):
-    """Seconds in a kubectl duration (`300s`, `1m30s`, `1.5m`, `0`); None when it is not one, which kubectl then rejects itself."""
-    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|[hms])", s)
-    if s.strip("0.") == "": return 0
-    if not parts or "".join(n + u for n, u in parts) != s: return None
-    return sum(float(n) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[u] for n, u in parts)
+    """Seconds in a Go duration as kubectl parses --timeout (`300s`, `1m30s`, `.5h`, `1.h`, `+1m`, `90000000us`, `0`);
+    None when it is not one, or is negative: kubectl answers those at once, inside the default bound."""
+    if re.fullmatch(r"[+-]?0", s): return 0
+    if not re.fullmatch(rf"\+?({GO_PART})+", s): return None
+    return sum(float(n) * GO_UNIT[u] for n, u in re.findall(GO_PART, s))
 
 def cmd_rollout(args):
     wait = go_seconds(args.timeout)
