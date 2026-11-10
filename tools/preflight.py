@@ -15,8 +15,8 @@ set": tracked and untracked files minus `frozen_lists` (sha256 manifests whose f
 The fast tier is static. --full adds test collection, a fix-removal run (changed tests against base code) and mutation
 of changed lines (--budget seconds), each in temporary `git worktree`s that are removed afterwards, under a macOS
 sandbox that denies signals to any process outside the test run's own tree (elsewhere those checks are skipped).
-After a full run on the branch whose mutation finished, the next one mutates only the lines changed
-since it (--mutate-all for all of them).
+Mutation traces which tests run each changed line and runs each mutant against only those. A later full run reuses a
+mutant's verdict while its line is unchanged (--mutate-all reruns them).
 Receipts: every run writes <git-common-dir>/preflight/<HEAD>.<fast|full>.json (head, dirty, partial, the open blocks
 and asks with their ids), so a hook or a reviewer can ask whether this exact commit passed without rerunning it.
 Dispositions: a ledger line `- <id> <reason>` (the run writes a template to OUT/ledger.md; pass it back with --ledger),
@@ -26,6 +26,7 @@ ci_only_dirs, status_vocab, secret_allow, dispositions, checks). `checks` lists 
 `<cmd> OUT/change.json`; each prints rows `check<TAB>severity<TAB>path<TAB>line<TAB>message<TAB>origin`.
 """
 import argparse, fnmatch, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -390,6 +391,14 @@ def cmd_run(a):
     (out / "change.json").write_text(json.dumps(ctx.as_json(out), indent=1))
     findings, timings, logs = [], {}, out / "logs"
     logs.mkdir(exist_ok=True)
+
+    def pack(spec):
+        s = time.time()
+        rows, err = run_pack(ctx, spec, out / "change.json")
+        return spec, rows, err, round(time.time() - s, 3)
+    # pack checks are subprocesses: run them beside jx's own, so the run takes the longest check, not the sum
+    pool = ThreadPoolExecutor(max_workers=max(1, len(packs)))
+    pending = [pool.submit(pack, spec) for spec in packs]
     for c in checks:
         s = time.time()
         try:
@@ -403,12 +412,12 @@ def cmd_run(a):
             (logs / f"{c.id}.err").write_text(traceback.format_exc())
             findings.append(Finding(c.id, "block", "", "", f"check crashed: {type(e).__name__}: {e} (see {logs / (c.id + '.err')})", "preflight"))
         timings[c.id] = round(time.time() - s, 3)
-    for spec in packs:
-        s = time.time()
-        rows, err = run_pack(ctx, spec, out / "change.json")
+    for job in pending:
+        spec, rows, err, secs = job.result()
         if err: (logs / f"{spec.get('id', 'pack')}.err").write_text(err)
         findings += rows
-        timings[spec.get("id", "pack")] = round(time.time() - s, 3)
+        timings[spec.get("id", "pack")] = secs
+    pool.shutdown()
     by_id, standing = dispositions(root, config, a.ledger)
     seen, unique = set(), []
     for f in findings:
@@ -448,7 +457,7 @@ def write_receipt(ctx, a, unique, code, out):
                open=[dict(id=f.id, check=f.check, severity=f.severity, path=f.path, line=f.line, message=f.message)
                      for f in unique if f.severity in ("block", "ask") and not f.disposition],
                counts={s: sum(f.severity == s for f in unique) for s in SEVERITIES},
-               mutation=getattr(ctx, "mutation", None))  # a later full run on this branch mutates only what changed since
+               mutation=getattr(ctx, "mutation", None))  # each mutant's verdict, which a later full run reuses
     path = d / f"{ctx.head}.{tier}.json"
     path.write_text(json.dumps(rec, indent=1))
     return path
@@ -515,7 +524,7 @@ def main():
     r.add_argument("--full", action="store_true", help="also collect tests, rerun changed tests on base code, and mutate changed lines")
     r.add_argument("--budget", type=int, default=600, help="seconds the mutation run may take (default 600)")
     r.add_argument("--mutate-all", action="store_true",
-                   help="mutate every changed line, not only those changed since this branch's last finished full run")
+                   help="rerun every mutant instead of reusing verdicts from an earlier full run of this branch")
     r.add_argument("--owned", nargs="*", default=[], help="globs this change may touch; anything else is a block")
     r.add_argument("--readonly", nargs="*", default=[], help="globs this change must not touch")
     r.add_argument("--ledger", help="ledger file with `- <id> <reason>` dispositions from an earlier run")

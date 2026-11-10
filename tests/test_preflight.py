@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -351,6 +352,16 @@ class HygieneAndRunnerTests(Base):
         code, rows, _ = r.run("--only", "pack.bad")
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
+    def test_pack_checks_run_side_by_side(self):
+        nap = 'import time; time.sleep(3); print("{}\\twarn\\ta.py\\t1\\tslept\\tPR 1")'
+        checks = [{"id": f"pack.nap{i}", "cmd": f"python3 -c '{nap.format(f'pack.nap{i}')}'"} for i in range(3)]
+        r = self.repo({"a.py": "x = 1\n", ".jx/preflight.json": json.dumps({"checks": checks})})
+        r.commit({"a.py": "x = 2\n"})
+        t0 = time.time()
+        rows = r.run("--only", "pack.nap*")[1]
+        self.assertEqual(sorted(x["check"] for x in rows), ["pack.nap0", "pack.nap1", "pack.nap2"])
+        self.assertLess(time.time() - t0, 8)  # one after another they take 9 s
+
     def test_receipt_records_head_tier_and_open_items(self):
         r = self.repo({"a.py": "x = 1\n", ".jx/pack.py": 'print("pack.q\\task\\ta.py\\t1\\tanswer me\\tPR 1")\n',
                        ".jx/preflight.json": json.dumps({"checks": [{"id": "pack.q", "cmd": "python3 .jx/pack.py"}]})})
@@ -427,18 +438,56 @@ class DynamicTests(Base):
                             "--full", "--only", "tests.mutate"], cwd=r.path, text=True, capture_output=True)  # a sandbox cannot nest
         self.assertEqual([(x["severity"], x["message"][:13]) for x in json.loads(p.stdout)], [("warn", "check skipped")], p.stderr)
 
-    def test_a_later_full_run_mutates_only_what_changed_since(self):
+    def mutate(self, r, *args):
+        rows = r.run("--full", "--only", "tests.mutate", "--budget", "120", *args)[1]
+        return {x["line"] for x in rows if x["severity"] == "warn"}, next(x["message"] for x in rows if x["severity"] == "info")
+
+    def test_a_later_full_run_reuses_the_verdicts_of_unchanged_lines(self):
         r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",
                        ".jx/preflight.json": self.config()})
         ok = 'def ok(x):\n    if x > 10:\n        return "fail"\n    return x\n'
         r.commit({"calc.py": ok})
-        first = {x["line"] for x in r.run("--full", "--only", "tests.mutate", "--budget", "120")[1] if x["severity"] == "warn"}
+        first, info = self.mutate(r)
+        verdicts = sum(int(n) for n in re.findall(r"(\d+) (?:killed|survived)", info))
         r.commit({"calc.py": ok + "\n\ndef twice(x):\n    return x * 2\n"})
+        lines, info = self.mutate(r)
+        self.assertIn(f"{verdicts} verdicts reused from the full run of", info)
+        self.assertEqual(lines, first | {8})  # ok()'s survivors still show, from the first run's verdicts
+        lines, info = self.mutate(r, "--mutate-all")
+        self.assertEqual((lines, "reused" in info), (first | {8}, False))
+        r.commit({"tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n    assert ok(11) == 'fail'\n"})
+        lines, info = self.mutate(r)  # a changed test file reruns the survivors, and the new assertion kills some
+        self.assertLess(len(lines), len(first | {8}))
+        self.assertNotIn(f"{verdicts} verdicts reused", info)
+
+    def test_a_run_its_budget_cut_short_resumes(self):
+        slow = "import time\ntime.sleep(2)\nfrom calc import ok\ndef test_ok():\n    assert ok(1) == 1\n"  # every pytest run costs 2 s
+        r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": slow, ".jx/preflight.json": self.config()})
+        r.commit({"calc.py": "def ok(x):\n    return x if x < 10 else 0\n"})
+        _, info = self.mutate(r, "--budget", "0")
+        self.assertRegex(info, r"^mutation: 0 killed, 0 survived, .* [1-9]\d* not run")
+        _, info = self.mutate(r)  # the same commit: nothing to reuse, so everything runs
+        ran = sum(int(n) for n in re.findall(r"(\d+) (?:killed|survived)", info))
+        self.assertTrue(ran and "reused" not in info, info)
+        t0 = time.time()
+        _, info = self.mutate(r)
+        self.assertIn(f"{ran} verdicts reused", info)
+        self.assertLess(time.time() - t0, 3)  # every verdict held, so no baseline, control mutant or worktree
+
+    def test_each_mutant_runs_only_the_tests_that_execute_its_line(self):
+        r = self.repo({"calc.py": "def ok(x):\n    return x\n\n\ndef other(x):\n    return x\n",
+                       "tests/test_calc.py": "def test_none():\n    pass\n", ".jx/preflight.json": self.config()})
+        child = 'subprocess.run([sys.executable, "-c", "from calc import other; assert other(1) in (0, 2)"], check=True{})'
+        test = ("import os, subprocess, sys\nfrom calc import ok\n\n\ndef test_ok():\n    assert ok(2) and not ok(1)\n\n\n"
+                "def test_other_in_a_child():\n    " + child.format("") + "\n")
+        r.commit({"calc.py": "def ok(x):\n    return x > 1\n\n\ndef other(x):\n    return x + 1\n", "tests/test_calc.py": test})
         rows = r.run("--full", "--only", "tests.mutate", "--budget", "120")[1]
-        self.assertIn("since the full run of", next(x["message"] for x in rows if x["severity"] == "info"))
-        self.assertEqual({x["line"] for x in rows if x["severity"] == "warn"}, {8})  # ok()'s survivors were the first run's
-        every = {x["line"] for x in r.run("--full", "--only", "tests.mutate", "--budget", "120", "--mutate-all")[1] if x["severity"] == "warn"}
-        self.assertEqual(every, first | {8})
+        self.assertEqual([(x["line"], x["message"].split(":")[0]) for x in rows if x["severity"] == "warn"],
+                         [(6, "mutant survived the 1 test(s) that run line 6")], rows)  # `x - 1`, seen only in the child
+        own_env = "\n\n\ndef test_own_env():\n    " + child.format(", env={'PATH': os.environ['PATH']}").replace("other(1) in (0, 2)", "True") + "\n"
+        r.commit({"tests/test_calc.py": test + own_env})
+        rows = r.run("--full", "--only", "tests.mutate", "--budget", "120")[1]
+        self.assertIn("mutant survived the 2 test(s) that run line 6", [x["message"].split(":")[0] for x in rows if x["severity"] == "warn"], rows)
 
     def test_fix_removal_and_collection(self):
         r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",

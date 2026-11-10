@@ -61,10 +61,18 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
   - **Mutation** splices one node's exact byte range per mutant, so file-hash tests stay meaningful. It first
     runs a no-op control mutant: tests that fail on the control (hash-pinned files) don't count as kills.
     Timeouts count as unknown. `--budget` bounds the run.
-  - **Incremental mutation.** Each full run records its mutation result in the receipt. When the branch already has a
-    finished full run (same merge base, clean tree, no mutant left unrun), the next full run mutates only the lines
-    changed since that commit, so a fix commit costs seconds rather than the whole budget. `--mutate-all` mutates
-    every changed line again.
+  - **Per-line test selection.** The baseline run is traced: a `sitecustomize` hook, loaded through `PYTHONPATH`
+    into pytest and every Python process its tests start, records which test (`PYTEST_CURRENT_TEST`) executes which
+    line of the file being mutated. Each mutant then runs only the tests that execute its line, plus any test seen
+    starting a process with an environment of its own. A line no test was seen running gets every test. A test
+    that reaches a line only through `python -I`, or through a child whose environment drops `PYTHONPATH`, is
+    invisible to the trace, so a kill it would make is missed. Workers default to half the CPUs, 2 to 4 (each is a worktree).
+  - **Reused verdicts.** Each full run records every mutant's verdict in the receipt (killed, survived, or unknown
+    for a timeout), keyed by its line's text and the mutation. A later full run whose HEAD descends from that run's
+    head reuses any verdict made with the same test files. When the test files changed, it reuses a kill while the
+    killing test still passes. Everything else runs again, including mutants a budget cut left unrun. When every
+    mutant of a file holds, nothing runs for it: no baseline, no control mutant, no worktree. `--mutate-all` reruns
+    every mutant.
   - **Fix-removal** reverts the non-test changes and reports changed tests that still pass. A parametrized test counts as one test: it is reported only when none of its cases fails.
 
 ## Repo config: `.jx/preflight.json`
@@ -86,7 +94,7 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
 
 ## Repo-pack contract
 
-A pack script receives `OUT/change.json` as its last argument:
+Pack scripts run side by side, and beside jx's own checks, so a run takes about as long as its slowest check. A pack script receives `OUT/change.json` as its last argument:
 
 - `repo_root`, `base`, `base_tip`, `merge_base`, `head`, `dirty`;
 - `files[]`, each with `path`, `status`, `old_path`, `excluded`, `binary`, `added`, `removed_old` and `hunks`;
