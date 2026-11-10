@@ -3,7 +3,7 @@
 names the past review miss it came from; `jx preflight ls` prints the catalogue.
 
   jx preflight run [--base origin/main] [--body DRAFT.md | --pr N] [--receipts DIR ...] [--topic T ...] [--full]
-      [--budget 600] [--owned GLOB ...] [--readonly GLOB ...] [--ledger FILE] [--only ID,..] [--skip ID,..]
+      [--budget 600] [--mutate-all] [--owned GLOB ...] [--readonly GLOB ...] [--ledger FILE] [--only ID,..] [--skip ID,..]
       [--strict] [--out DIR] [--dry-run]                    findings TSV: id, check, severity, path, line, message, origin,
                                                             disposition; exit 1 while a block (or, with --strict, an ask) is open
   jx preflight ls                                           every check: id, tier, severity, origin, what it finds
@@ -15,6 +15,8 @@ set": tracked and untracked files minus `frozen_lists` (sha256 manifests whose f
 The fast tier is static. --full adds test collection, a fix-removal run (changed tests against base code) and mutation
 of changed lines (--budget seconds), each in temporary `git worktree`s that are removed afterwards, under a macOS
 sandbox that denies signals to any process outside the test run's own tree (elsewhere those checks are skipped).
+After a full run on the branch whose mutation finished, the next one mutates only the lines changed
+since it (--mutate-all for all of them).
 Receipts: every run writes <git-common-dir>/preflight/<HEAD>.<fast|full>.json (head, dirty, partial, the open blocks
 and asks with their ids), so a hook or a reviewer can ask whether this exact commit passed without rerunning it.
 Dispositions: a ledger line `- <id> <reason>` (the run writes a template to OUT/ledger.md; pass it back with --ledger),
@@ -445,7 +447,8 @@ def write_receipt(ctx, a, unique, code, out):
                merge_base=ctx.merge_base, created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), exit=code, out=str(out),
                open=[dict(id=f.id, check=f.check, severity=f.severity, path=f.path, line=f.line, message=f.message)
                      for f in unique if f.severity in ("block", "ask") and not f.disposition],
-               counts={s: sum(f.severity == s for f in unique) for s in SEVERITIES})
+               counts={s: sum(f.severity == s for f in unique) for s in SEVERITIES},
+               mutation=getattr(ctx, "mutation", None))  # a later full run on this branch mutates only what changed since
     path = d / f"{ctx.head}.{tier}.json"
     path.write_text(json.dumps(rec, indent=1))
     return path
@@ -511,6 +514,8 @@ def main():
     r.add_argument("--topic", nargs="*", default=[], help="spec topics; governing-doc sections that match become asks")
     r.add_argument("--full", action="store_true", help="also collect tests, rerun changed tests on base code, and mutate changed lines")
     r.add_argument("--budget", type=int, default=600, help="seconds the mutation run may take (default 600)")
+    r.add_argument("--mutate-all", action="store_true",
+                   help="mutate every changed line, not only those changed since this branch's last finished full run")
     r.add_argument("--owned", nargs="*", default=[], help="globs this change may touch; anything else is a block")
     r.add_argument("--readonly", nargs="*", default=[], help="globs this change must not touch")
     r.add_argument("--ledger", help="ledger file with `- <id> <reason>` dispositions from an earlier run")

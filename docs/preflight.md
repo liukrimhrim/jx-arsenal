@@ -61,6 +61,10 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
   - **Mutation** splices one node's exact byte range per mutant, so file-hash tests stay meaningful. It first
     runs a no-op control mutant: tests that fail on the control (hash-pinned files) don't count as kills.
     Timeouts count as unknown. `--budget` bounds the run.
+  - **Incremental mutation.** Each full run records its mutation result in the receipt. When the branch already has a
+    finished full run (same merge base, clean tree, no mutant left unrun), the next full run mutates only the lines
+    changed since that commit, so a fix commit costs seconds rather than the whole budget. `--mutate-all` mutates
+    every changed line again.
   - **Fix-removal** reverts the non-test changes and reports changed tests that still pass. A parametrized test counts as one test: it is reported only when none of its cases fails.
 
 ## Repo config: `.jx/preflight.json`
