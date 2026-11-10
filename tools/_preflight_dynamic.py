@@ -53,9 +53,12 @@ def sandbox_problem():
     return f"sandbox-exec exited {p.returncode}: {p.stderr.strip()[:200]} (inside another sandbox? run jx preflight outside it)" if p.returncode else ""
 
 
-def pytest(ctx, tree, files, timeout=None, extra=(), env=None):
+def pytest(ctx, tree, files, timeout=None, extra=(), env=None, times=None):
     """Run pytest on files inside tree. Returns (status, {case: pass|fail|skip}, seconds); status is ok, failed or timeout."""
     if sandbox_problem(): raise Skipped(f"tests must not run where they can signal processes outside their own tree: {sandbox_problem()}")
+    left = ctx.deadline - time.time() - 4  # the run's budget, less the time to remove worktrees and write the report
+    if left <= 0: return "timeout", {}, 0.0, ""
+    timeout = min(timeout or left, left)
     fd, junit = tempfile.mkstemp(suffix=".xml", prefix="jx-preflight-"); os.close(fd)
     argv = ["sandbox-exec", "-p", SANDBOX, ctx.test_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", *extra, *files]
     t0 = time.time()
@@ -73,6 +76,7 @@ def pytest(ctx, tree, files, timeout=None, extra=(), env=None):
         for case in ET.parse(junit).iter("testcase"):
             key = f"{case.get('classname', '')}::{case.get('name', '')}"
             cases[key] = "fail" if case.find("failure") is not None or case.find("error") is not None else "skip" if case.find("skipped") is not None else "pass"
+            if times is not None: times[key] = float(case.get("time") or 0)
     except (ET.ParseError, OSError):
         pass
     finally:
@@ -99,11 +103,11 @@ def tests_collect(ctx):
         if "--collect-only" not in toks and "--co" not in toks: toks += ["--collect-only", "-q"]
         if "no:cacheprovider" not in toks: toks += ["-p", "no:cacheprovider"]
         try:
-            p = subprocess.run(toks, cwd=ctx.root, env=env, text=True, capture_output=True, timeout=900)
+            p = subprocess.run(toks, cwd=ctx.root, env=env, text=True, capture_output=True, timeout=max(1, ctx.deadline - time.time() - 2))
         except FileNotFoundError:
             yield "", "", f"`{raw}`: {toks[0]} not found; set test_python or fix the command", "block"; continue
         except subprocess.TimeoutExpired:
-            yield "", "", f"`{raw}` did not finish collecting in 900 s", "warn"; continue
+            yield "", "", f"`{raw}` did not finish collecting within the run's {ctx.args.budget} s budget", "warn"; continue
         if p.returncode not in (0, 5):
             text = p.stdout + p.stderr
             errs = [l for l in text.splitlines() if re.match(r"^(ERROR|E\s|ImportError|ModuleNotFoundError)", l)]
@@ -150,7 +154,10 @@ def tests_fix_removal(ctx):
                 p = subprocess.run(["git", "-C", str(ctx.root), "show", f"{ctx.merge_base}:{f.old_path}"], capture_output=True)
                 if p.returncode == 0:
                     (d / f.old_path).parent.mkdir(parents=True, exist_ok=True); (d / f.old_path).write_bytes(p.stdout)
-        status, cases, _, _ = pytest(ctx, d, [f.path for f in tests if fns[f.path]], timeout=1800)
+        names = sorted({name for path in fns for name in fns[path]})  # -k keeps the run to the changed tests
+        status, cases, _, _ = pytest(ctx, d, [f.path for f in tests if fns[f.path]], extra=("-k", " or ".join(names)))
+        if status == "timeout":
+            yield "", "", f"the changed tests did not finish on the base code within the run's {ctx.args.budget} s budget; fix-removal is incomplete", "info"
         states = {}  # (path, function) -> results of all its cases; a parametrized test is caught if any case fails
         for key, st in cases.items():
             path = _case_file(key, list(fns))
@@ -196,8 +203,8 @@ def mutants(src, tree, lines, vocab):
             m = copy.copy(n); m.op = ast.Or() if isinstance(n.op, ast.And) else ast.And(); rep = f"({ast.unparse(m)})"
         elif isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
             rep = f"({seg(n.operand)})"
-        elif isinstance(n, ast.Constant) and type(n.value) is int and not isinstance(par.get(n), ast.UnaryOp):
-            rep = str(n.value + 1)
+        elif isinstance(n, ast.Constant) and type(n.value) is int and isinstance(par.get(n), ast.Compare):
+            rep = str(n.value + 1)  # a boundary; elsewhere (a timeout, a size, an index) the mutant is mostly noise
         elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in vocab and not isinstance(par.get(n), ast.Expr):
             rep = repr(vocab[(vocab.index(n.value) + 1) % len(vocab)])
         elif isinstance(n, ast.Return) and n.value is not None and not (isinstance(n.value, ast.Constant) and n.value.value is None):
@@ -276,15 +283,15 @@ if _target and _out:
 """
 
 
-def traced(ctx, tree, files, path, timeout):
-    """The baseline run, traced: (status, cases, seconds, output, {line: {test node ids}}, {node ids the trace cannot follow})."""
+def traced(ctx, tree, files, path, timeout, times=None):
+    """One traced run: (status, cases, seconds, output, {line: {test node ids}}, {node ids the trace cannot follow})."""
     out, site = Path(tempfile.mkdtemp(prefix="jx-trace-")), Path(tempfile.mkdtemp(prefix="jx-tracer-"))
     try:
         (site / "sitecustomize.py").write_text(TRACER)
         env = _env(ctx)
         env.update(JX_TRACE_FILE=os.path.realpath(tree / path), JX_TRACE_OUT=str(out),
                    PYTHONPATH=os.pathsep.join(filter(None, [str(site), env.get("PYTHONPATH")])))
-        status, cases, secs, text = pytest(ctx, tree, files, timeout=timeout, env=env)
+        status, cases, secs, text = pytest(ctx, tree, files, timeout=timeout, env=env, times=times)
         lines, opaque = {}, set()
         for f in out.glob("*.tsv"):
             for row in f.read_text(errors="replace").splitlines():
@@ -297,9 +304,42 @@ def traced(ctx, tree, files, path, timeout):
         shutil.rmtree(out, ignore_errors=True); shutil.rmtree(site, ignore_errors=True)
 
 
+def baseline(ctx, trees, tests, path, src, deadline):
+    """The traced baseline of `tests` on the file with one comment appended (no line moves), split across every
+    worktree so no worker idles: a dict of the passing cases, whether any failed, each case's seconds, which tests run
+    which line and which the trace cannot follow; plus the status and output. A test that pins the file's hash fails
+    here, so it is not among the tests whose failure counts as a kill."""
+    listing = pytest(ctx, trees[0], tests, extra=("--collect-only",))[3]
+    ids = [line for line in listing.splitlines() if re.match(r"\S+?\.py::\S", line)]
+    chunks = [c for c in (ids[i::len(trees)] for i in range(len(trees))) if c] or [tests]  # no listing: one run of the files
+    used = trees[:len(chunks)]
+    times = {}
+    for t in used: (t / path).write_bytes(src + b"\n# jx-preflight control mutant\n")
+    try:
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            parts = list(pool.map(lambda tc: traced(ctx, tc[0], tc[1], path, deadline - time.time(), times), zip(used, chunks)))
+    finally:
+        for t in used: (t / path).write_bytes(src)
+    cases, covering, opaque = {}, {}, set()
+    for _, part, _, _, lines, blind in parts:
+        cases.update(part); opaque |= blind
+        for ln, who in lines.items(): covering.setdefault(ln, set()).update(who)
+    status = next((st for st in ("timeout", "failed") if any(part[0] == st for part in parts)), "ok")
+    return dict(passing=sorted(k for k, v in cases.items() if v == "pass"), clean=all(v != "fail" for v in cases.values()),
+                times=times, covering={str(k): sorted(v) for k, v in covering.items()}, opaque=sorted(opaque)), status, parts[-1][3]
+
+
+def _junit_key(nodeid):
+    """The `classname::name` this module's pytest() gives a node id, as pytest's junit report names it."""
+    path, bracket, params = nodeid.partition("[")
+    names = path.split("::")
+    names[0] = re.sub(r"\.py$", "", names[0].replace("/", "."))
+    return f"{'.'.join(names[:-1])}::{names[-1]}{bracket}{params}"
+
+
 def earlier_verdicts(ctx):
     """(head, {mutant key: result}) from the latest earlier jx full run whose head is HEAD or an ancestor of it."""
-    if getattr(ctx.args, "mutate_all", False): return None, {}
+    if getattr(ctx.args, "mutate_all", False): return None, {}, {}
     common = Path(run(["git", "-C", str(ctx.root), "rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.strip())
     best = None
     for p in (common / "preflight").glob("*.full.json"):
@@ -309,19 +349,22 @@ def earlier_verdicts(ctx):
         if not (isinstance(m, dict) and isinstance(m.get("results"), list) and rec.get("runner") == "jx" and isinstance(rec.get("head"), str)): continue
         if run(["git", "-C", str(ctx.root), "merge-base", "--is-ancestor", rec["head"], "HEAD"], check=False).returncode: continue
         if best is None or str(rec.get("created", "")) > str(best.get("created", "")): best = rec
-    if best is None: return None, {}
-    return best["head"], {tuple(r["key"]): r for r in best["mutation"]["results"] if isinstance(r, dict) and isinstance(r.get("key"), list)}
+    if best is None: return None, {}, {}
+    base = best["mutation"].get("baselines")
+    return (best["head"], {tuple(r["key"]): r for r in best["mutation"]["results"] if isinstance(r, dict) and isinstance(r.get("key"), list)},
+            base if isinstance(base, dict) else {})
 
 
 def tests_mutate(ctx):
     vocab = list(ctx.config.get("status_vocab") or [])
-    deadline = time.time() + ctx.args.budget
-    since, earlier = earlier_verdicts(ctx)
+    deadline = ctx.deadline - 6  # no mutant starts after this; the last ones are stopped 2 s later
+    since, earlier, baselines = earlier_verdicts(ctx)
+    kept = {}  # baselines to keep for the next run
     targets = [f for f in ctx.changed(".py", tests=False) if f.added and ctx.tree(f.path) is not None]
     total, results = dict(killed=0, survived=0, unknown=0, skipped=0, reused=0), []
     if not targets:
-        ctx.mutation = dict(total, results=results); return
-    workers = max(1, int(ctx.config.get("workers") or min(4, max(2, (os.cpu_count() or 4) // 2))))
+        ctx.mutation = dict(total, results=results, baselines={}); return
+    workers = max(1, int(ctx.config.get("workers") or min(8, max(2, (os.cpu_count() or 4) - 2))))
     trees, free, lock = [], [], threading.Lock()  # worktrees are made on first need: a rerun that reuses every verdict makes none
     try:
         for f in targets:
@@ -347,25 +390,32 @@ def tests_mutate(ctx):
                 old = earlier.get(tuple(key(ln, desc)))
                 return old if old and old.get("tests_sha") == tests_sha and old.get("verdict") in ("killed", "survived", "unknown") else None
 
-            passing = pinned = set(); covering, opaque, per = {}, set(), 0
-            if not all(held(ln, m[3]) for ln, m in order):  # something must run: baseline, control mutant, worktrees
+            passing, covering, opaque, times, clean = set(), {}, set(), {}, True
+            if not all(held(ln, m[3]) for ln, m in order):  # something must run: a baseline and worktrees
                 if time.time() > deadline: total["skipped"] += len(muts); continue
                 if not trees:
-                    trees.extend(worktree(ctx) for _ in range(workers)); free.extend(trees)
-                status, base, secs, out, covering, opaque = traced(ctx, trees[0], tests, f.path, timeout=max(60, deadline - time.time()))
-                passing = {k for k, v in base.items() if v == "pass"}
-                if not passing:
-                    yield f.path, "", f"baseline tests for {f.path} pass nothing ({status}); mutation skipped: {out.strip()[-200:]}"; continue
-                (trees[0] / f.path).write_bytes(src + b"\n# jx-preflight control mutant\n")
-                _, ctrl, _, _ = pytest(ctx, trees[0], tests, timeout=3 * secs + 30)
-                (trees[0] / f.path).write_bytes(src)
-                pinned = {k for k in passing if ctrl.get(k) != "pass"}
-                per = 3 * secs + 5
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        trees.extend(pool.map(lambda _: worktree(ctx), range(workers)))
+                    free.extend(trees)
+                stamp = hashlib.sha256(src + tests_sha.encode()).hexdigest()  # this file's bytes and its test files'
+                base = baselines.get(stamp)
+                if not base:
+                    base, status, out = baseline(ctx, trees, tests, f.path, src, deadline)
+                    if status == "timeout":
+                        total["skipped"] += len(muts)
+                        yield f.path, "", (f"the tests for {f.path} did not finish once within the run's {ctx.args.budget} s budget, so none "
+                                           f"of its {len(muts)} mutants ran; raise --budget for this change"), "info"; continue
+                    if not base["passing"]:
+                        yield f.path, "", f"baseline tests for {f.path} pass nothing ({status}); mutation skipped: {out.strip()[-200:]}"; continue
+                kept[stamp] = base
+                passing, clean, opaque = set(base["passing"]), base["clean"], set(base["opaque"])
+                covering = {int(k): set(v) for k, v in base["covering"].items()}
+                times = base["times"]
 
             def one(item):
                 ln, (a, b, rep, desc) = item
                 old = held(ln, desc) or earlier.get(tuple(key(ln, desc)))
-                if old and (held(ln, desc) or (old.get("verdict") == "killed" and old.get("killer") in passing - pinned)):
+                if old and (held(ln, desc) or (old.get("verdict") == "killed" and old.get("killer") in passing)):
                     return ln, desc, old["verdict"], old.get("killer"), old.get("ran"), True
                 if time.time() > deadline: return ln, desc, "skipped", None, None, False
                 new = src[:a] + rep.encode() + src[b:]
@@ -375,20 +425,22 @@ def tests_mutate(ctx):
                 # environment drops PYTHONPATH without passing env= to Popen, is invisible to the trace, so its kill is
                 # missed. Tests seen starting a process with their own env always run; lines no test was seen running
                 # get every test, as before.
-                picked = sorted(covering.get(ln, set()) | opaque)
-                run_on = picked if covering.get(ln) else tests
+                # the tests that run this line, fastest first so -x reaches a kill soonest; none that fails anyway
+                picked = sorted((t for t in covering.get(ln, set()) | opaque if _junit_key(t) in passing),
+                                key=lambda t: (times.get(_junit_key(t), 0), t))
+                run_on = picked if picked and covering.get(ln) else tests
+                per = 3 * sum(times.get(_junit_key(t), 0) for t in picked) + 10 if run_on is picked else 3 * sum(times.values()) + 10
                 with lock: t = free.pop()
                 try:
                     (t / f.path).write_bytes(new)
-                    st, res, _, _ = pytest(ctx, t, run_on, timeout=per, extra=("-x",) if not pinned else ())
+                    st, res, _, _ = pytest(ctx, t, run_on, timeout=per, extra=("-x",) if clean or run_on is picked else ())
                 finally:
                     (t / f.path).write_bytes(src)
                     with lock: free.append(t)
-                killer = next((k for k in sorted(res) if res[k] == "fail" and k in passing - pinned), None)
-                ran = len(picked) if covering.get(ln) else None
-                if st == "timeout": return ln, desc, "unknown", None, ran, False
+                killer = next((k for k in sorted(res) if res[k] == "fail" and k in passing), None)
+                ran = len(picked) if run_on is picked else None
                 if killer: return ln, desc, "killed", killer, ran, False
-                if any(res.get(k) == "fail" for k in pinned): return ln, desc, "unknown", None, ran, False
+                if st == "timeout": return ln, desc, ("skipped" if time.time() > deadline else "unknown"), None, ran, False
                 if st == "failed" and not res: return ln, desc, "killed", None, ran, False
                 return ln, desc, "survived", None, ran, False
 
@@ -401,12 +453,13 @@ def tests_mutate(ctx):
                     if verdict == "survived":
                         who = f"the {ran} test(s) that run line {ln}" if ran else f"{len(tests)} test files"
                         yield f.path, ln, f"mutant survived {who}: {desc}; no test notices this change in behaviour"
-        ctx.mutation = dict(total, results=results)
+        ctx.mutation = dict(total, results=results, baselines=kept)
         reuse = f"; {total['reused']} verdicts reused from the full run of {since[:12]} (--mutate-all reruns them)" if total["reused"] else ""
         yield "", "", (f"mutation: {total['killed']} killed, {total['survived']} survived, {total['unknown']} unknown (timeout or "
-                       f"hash-pinned), {total['skipped']} not run (budget {ctx.args.budget}s){reuse}"), "info"
+                       f"hash-pinned), {total['skipped']} not run within the run's {ctx.args.budget} s budget{'; run again to go on from here' if total['skipped'] else ''}{reuse}"), "info"
     finally:
-        for t in trees: drop(ctx, t)
+        with ThreadPoolExecutor(max_workers=max(1, len(trees))) as pool:
+            list(pool.map(lambda t: drop(ctx, t), trees))
 
 
 CHECKS = [

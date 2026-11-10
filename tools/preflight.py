@@ -3,7 +3,7 @@
 names the past review miss it came from; `jx preflight ls` prints the catalogue.
 
   jx preflight run [--base origin/main] [--body DRAFT.md | --pr N] [--receipts DIR ...] [--topic T ...] [--full]
-      [--budget 600] [--mutate-all] [--owned GLOB ...] [--readonly GLOB ...] [--ledger FILE] [--only ID,..] [--skip ID,..]
+      [--budget 60] [--mutate-all] [--owned GLOB ...] [--readonly GLOB ...] [--ledger FILE] [--only ID,..] [--skip ID,..]
       [--strict] [--out DIR] [--dry-run]                    findings TSV: id, check, severity, path, line, message, origin,
                                                             disposition; exit 1 while a block (or, with --strict, an ask) is open
   jx preflight ls                                           every check: id, tier, severity, origin, what it finds
@@ -17,6 +17,8 @@ of changed lines (--budget seconds), each in temporary `git worktree`s that are 
 sandbox that denies signals to any process outside the test run's own tree (elsewhere those checks are skipped).
 Mutation traces which tests run each changed line and runs each mutant against only those. A later full run reuses a
 mutant's verdict while its line is unchanged (--mutate-all reruns them).
+Budget: the whole run ends within --budget seconds (default 60). Checks run side by side; one still running when the
+budget ends is stopped and says what it left undone, and mutation keeps its verdicts so the next run goes on from there.
 Receipts: every run writes <git-common-dir>/preflight/<HEAD>.<fast|full>.json (head, dirty, partial, the open blocks
 and asks with their ids), so a hook or a reviewer can ask whether this exact commit passed without rerunning it.
 Dispositions: a ledger line `- <id> <reason>` (the run writes a template to OUT/ledger.md; pass it back with --ledger),
@@ -255,6 +257,7 @@ class Change:
                     body_path=str(out / "body.md") if self.body is not None else None,
                     receipts=self.args.receipts or [], topics=self.args.topic or [], owned=self.args.owned or [],
                     readonly=self.args.readonly or [], full=self.args.full, budget=self.args.budget, out_dir=str(out),
+                    deadline=getattr(self, "deadline", None),  # epoch seconds by which a pack script must have printed its rows
                     test_python=self.config.get("test_python") or None, config=self.config)
 
 
@@ -335,18 +338,30 @@ def run_pack(ctx, spec, change_json):
     cmd = spec["cmd"] if isinstance(spec["cmd"], list) else shlex.split(spec["cmd"])
     if cmd and cmd[0] in ("python", "python3"): cmd = [sys.executable, *cmd[1:]]
     try:
-        p = run([*cmd, str(change_json)], cwd=ctx.root, check=False, timeout=spec.get("timeout", 1800))
-    except (Missing, subprocess.TimeoutExpired) as e:
-        return [Finding(spec.get("id", "pack"), "block", "", "", f"pack check did not run: {e}", "preflight")], ""
+        p = subprocess.Popen([*cmd, str(change_json)], cwd=ctx.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             start_new_session=True)
+    except FileNotFoundError:
+        return [Finding(spec.get("id", "pack"), "block", "", "", f"pack check did not run: {cmd[0]} not found", "preflight")], ""
+    late = []
+    try:
+        out, err = p.communicate(timeout=max(1, min(spec.get("timeout", 1800), ctx.deadline - time.time())))
+    except subprocess.TimeoutExpired:  # stop the script and what it started; rows it already printed still count
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError): pass
+        out, err = p.communicate()
+        late = [Finding(spec.get("id", "pack"), "warn", "", "", f"did not finish within the run's {ctx.args.budget} s budget, so "
+                        "findings are missing; a pack script reads `deadline` from change.json to stop in time", "preflight")]
     rows = []
-    for line in p.stdout.splitlines():
+    for line in out.splitlines():
         cols = line.split("\t")
         if len(cols) >= 6 and cols[0] != "check":
             rows.append(Finding(cols[0], cols[1], cols[2], cols[3], "\t".join(cols[4:-1]), cols[-1]))
+    if late:
+        return rows + late, err
     if p.returncode:
         rows.append(Finding(spec.get("id", "pack"), "block", "", "", f"pack script exited {p.returncode}: "
-                            f"{(p.stderr.strip().splitlines() or [''])[-1][:300]}", "preflight"))
-    return rows, p.stderr
+                            f"{(err.strip().splitlines() or [''])[-1][:300]}", "preflight"))
+    return rows, err
 
 
 def selected(checks, a):
@@ -375,6 +390,7 @@ def cmd_run(a):
     checks = selected(catalogue(), a)
     t0 = time.time()
     ctx = Change(root, a, config)
+    ctx.deadline = t0 + a.budget  # the whole run ends by then: every test run and pack script is cut to what is left
     packs = [s for s in pack_checks(ctx) if not a.only or any(fnmatch.fnmatch(s.get("id", ""), o) for x in a.only for o in x.split(","))]
     if a.dry_run:
         rows = [dict(check=c.id, tier=c.tier, kind="jx", reason=c.finds) for c in checks]
@@ -396,22 +412,27 @@ def cmd_run(a):
         s = time.time()
         rows, err = run_pack(ctx, spec, out / "change.json")
         return spec, rows, err, round(time.time() - s, 3)
-    # pack checks are subprocesses: run them beside jx's own, so the run takes the longest check, not the sum
-    pool = ThreadPoolExecutor(max_workers=max(1, len(packs)))
-    pending = [pool.submit(pack, spec) for spec in packs]
-    for c in checks:
+    def own(c):
         s = time.time()
         try:
-            findings += c(ctx)
+            rows = c(ctx)
         except Missing as e:
-            findings.append(Finding(c.id, "warn", "", "", f"{e}: not found on PATH; check skipped", "preflight"))
+            rows = [Finding(c.id, "warn", "", "", f"{e}: not found on PATH; check skipped", "preflight")]
         except Skipped as e:
-            findings.append(Finding(c.id, "warn", "", "", f"check skipped: {e}", "preflight"))
+            rows = [Finding(c.id, "warn", "", "", f"check skipped: {e}", "preflight")]
         except Exception as e:  # a crashing check must not hide the others; it reports itself as a block
             import traceback
             (logs / f"{c.id}.err").write_text(traceback.format_exc())
-            findings.append(Finding(c.id, "block", "", "", f"check crashed: {type(e).__name__}: {e} (see {logs / (c.id + '.err')})", "preflight"))
-        timings[c.id] = round(time.time() - s, 3)
+            rows = [Finding(c.id, "block", "", "", f"check crashed: {type(e).__name__}: {e} (see {logs / (c.id + '.err')})", "preflight")]
+        return c, rows, round(time.time() - s, 3)
+    # pack checks are subprocesses and the full-tier checks run tests: all start now, beside the static checks, so
+    # the run takes the longest check, not the sum
+    pool = ThreadPoolExecutor(max_workers=max(1, len(packs) + len(checks)))
+    pending = [pool.submit(pack, spec) for spec in packs]
+    slow = [pool.submit(own, c) for c in checks if c.tier == "full"]
+    for c, rows, secs in [own(c) for c in checks if c.tier != "full"] + [job.result() for job in slow]:
+        findings += rows
+        timings[c.id] = secs
     for job in pending:
         spec, rows, err, secs = job.result()
         if err: (logs / f"{spec.get('id', 'pack')}.err").write_text(err)
@@ -522,7 +543,7 @@ def main():
     r.add_argument("--receipts", nargs="*", default=[], help="`jx check run` receipt dirs backing test-count claims")
     r.add_argument("--topic", nargs="*", default=[], help="spec topics; governing-doc sections that match become asks")
     r.add_argument("--full", action="store_true", help="also collect tests, rerun changed tests on base code, and mutate changed lines")
-    r.add_argument("--budget", type=int, default=600, help="seconds the mutation run may take (default 600)")
+    r.add_argument("--budget", type=int, default=60, help="seconds the whole run may take (default 60)")
     r.add_argument("--mutate-all", action="store_true",
                    help="rerun every mutant instead of reusing verdicts from an earlier full run of this branch")
     r.add_argument("--owned", nargs="*", default=[], help="globs this change may touch; anything else is a block")
