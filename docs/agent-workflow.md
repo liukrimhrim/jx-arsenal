@@ -120,6 +120,10 @@ omit `--out` to use a fresh temporary directory. The wrapper runs an argv direct
 without a shell or retries. Full stdout/stderr go to `output.log`. `result.json` records
 the exact command, working directory, start time, elapsed time, exit status, and Git
 state before/after. `summary.txt` is the short, reusable report. `show` does not rerun it.
+In a Git repository each receipt is also indexed at
+`<git-common-dir>/jx-check/<HEAD>/<hash of DIR>.json` (`result.json` plus `out`), so a
+later tool can find the runs made at a commit without being told where they went; a repo's
+preflight pack can then check a test run instead of repeating it.
 
 JUnit counts come from actual test cases. Missing, malformed or empty requested XML
 cannot pass, and failing cases cannot pass even if the command returns zero. Skipped

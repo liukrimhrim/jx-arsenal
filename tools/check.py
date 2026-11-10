@@ -5,6 +5,8 @@
   jx check show DIR
 
 DIR must be new; default is a temporary directory. {out} in COMMAND expands to DIR.
+In a Git repository the receipt is also indexed at <git-common-dir>/jx-check/<HEAD>/<hash of DIR>.json
+(result.json plus `out`), so a later tool, such as a `jx preflight` pack, can find the runs made at a commit.
 --junit names a fresh XML file inside DIR, written by COMMAND. Counts come from test
 cases, not console text. No command selection, automatic retries or cached PASS.
 Full output stays in output.log; stdout contains only a short result and file paths.
@@ -56,6 +58,8 @@ def render(result, out):
     if result.get('report_error'):
         lines.append('report error: ' + result['report_error'])
     lines.extend([f"log: {out / 'output.log'}", f"receipt: {out / 'result.json'}"])
+    if result.get('index') or result.get('index_error'):
+        lines.append(f"index: {result.get('index') or 'not written: ' + result['index_error']}")
     return '\n'.join(lines) + '\n'
 
 
@@ -76,7 +80,7 @@ def main():
     argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
     if not argv:
         parser.error('provide a command after --')
-    out = args.out.resolve() if args.out else Path(tempfile.mkdtemp(prefix='jx-check-'))
+    out = (args.out or Path(tempfile.mkdtemp(prefix='jx-check-'))).resolve()  # macOS TMPDIR is under the /var symlink
     if args.out:
         out.mkdir(parents=True, exist_ok=False)
     junit = (out / args.junit).resolve() if args.junit else None
@@ -104,6 +108,16 @@ def main():
         except (OSError, ET.ParseError, ValueError) as error:
             result['report_error'] = str(error)
             result['exit_code'] = result['exit_code'] or 2
+    common = result['before'] and subprocess.run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                                 capture_output=True, text=True).stdout.strip()
+    if common:  # keyed by the DIR path, which is new for each run
+        index = Path(common) / 'jx-check' / result['before']['head'] / f"{hashlib.sha256(str(out).encode()).hexdigest()[:16]}.json"
+        try:
+            index.parent.mkdir(parents=True, exist_ok=True)
+            index.write_text(json.dumps(dict(result, out=str(out)), indent=2) + '\n')
+            result['index'] = str(index)
+        except OSError as error:  # the receipt in DIR stands; only the lookup by commit is lost
+            result['index_error'] = str(error)
     (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     summary = render(result, out)
     (out / 'summary.txt').write_text(summary)
