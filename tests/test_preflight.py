@@ -427,6 +427,19 @@ class DynamicTests(Base):
                             "--full", "--only", "tests.mutate"], cwd=r.path, text=True, capture_output=True)  # a sandbox cannot nest
         self.assertEqual([(x["severity"], x["message"][:13]) for x in json.loads(p.stdout)], [("warn", "check skipped")], p.stderr)
 
+    def test_a_later_full_run_mutates_only_what_changed_since(self):
+        r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",
+                       ".jx/preflight.json": self.config()})
+        ok = 'def ok(x):\n    if x > 10:\n        return "fail"\n    return x\n'
+        r.commit({"calc.py": ok})
+        first = {x["line"] for x in r.run("--full", "--only", "tests.mutate", "--budget", "120")[1] if x["severity"] == "warn"}
+        r.commit({"calc.py": ok + "\n\ndef twice(x):\n    return x * 2\n"})
+        rows = r.run("--full", "--only", "tests.mutate", "--budget", "120")[1]
+        self.assertIn("since the full run of", next(x["message"] for x in rows if x["severity"] == "info"))
+        self.assertEqual({x["line"] for x in rows if x["severity"] == "warn"}, {8})  # ok()'s survivors were the first run's
+        every = {x["line"] for x in r.run("--full", "--only", "tests.mutate", "--budget", "120", "--mutate-all")[1] if x["severity"] == "warn"}
+        self.assertEqual(every, first | {8})
+
     def test_fix_removal_and_collection(self):
         r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",
                        ".jx/preflight.json": self.config()})
