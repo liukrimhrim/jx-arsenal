@@ -438,6 +438,10 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(inv("pip install pytest"), [])
         self.assertEqual(inv("pytest -q tests 2>&1 | tee log.txt"), [("run", ["tests"], [])])
         self.assertEqual(inv('pytest -m "not slow" --cov src tests > out.txt'), [("run", ["tests"], [])])
+        self.assertEqual(inv('echo "Run pytest tests/"'), [])  # pytest inside a quoted word is no command
+        self.assertEqual(inv("pytest -o 'filterwarnings=ignore:foo|bar' tests/unit"), [("run", ["tests/unit"], [])])  # a quoted pipe splits nothing
+        self.assertEqual(inv('pytest -k "a; b" tests/x && pytest tests/y; echo done'), [("partial", ["tests/x"], []), ("run", ["tests/y"], [])])
+        self.assertEqual(inv("pytest a 2>&1\npytest b"), [("run", ["a"], []), ("run", ["b"], [])])
 
     def test_ignore_of_a_file_or_a_slashed_directory_is_honoured(self):
         wf = "jobs:\n  t:\n    steps:\n      - run: pytest tests --ignore=tests/test_b.py --ignore=tests/slow/\n"
