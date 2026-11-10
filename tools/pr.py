@@ -32,12 +32,13 @@ NOT_FOUND = {
 }
 
 def sh(args, stdin=None):
-    try: p = subprocess.run(args, input=stdin, text=True, capture_output=True)
+    try: p = subprocess.run(args, input=stdin, text=True, errors="replace", capture_output=True)
     except FileNotFoundError: sys.exit("`gh` not found on PATH; install the GitHub CLI, then `gh auth login`")
     if p.returncode:
         err = p.stderr.strip() or p.stdout.strip()
-        if re.search(r"auth|login|token|401|403", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
-        elif re.search(r"404|not found|could not resolve", err, re.I): hint, code = "→ " + NOT_FOUND.get(CMD, "check the id"), 1
+        # not-found first, and auth only on gh's own phrasings: a PR numbered 403 or a repo named auth-service is not an auth failure
+        if re.search(r"HTTP 404|not found|could not resolve", err, re.I): hint, code = "→ " + NOT_FOUND.get(CMD, "check the id"), 1
+        elif re.search(r"HTTP 40[13]\b|gh auth login|authenticat|bad credentials", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
         else: hint, code = "", 1
         sys.stderr.write(f"{err}\n{hint}\n" if hint else err + "\n"); sys.exit(code)
     return p.stdout
@@ -48,6 +49,10 @@ def api(path, method="GET", body=None, repo=None):
     if body is not None: args += ["--input", "-"]
     out = gh(*args, stdin=json.dumps(body) if body is not None else None)
     return json.loads(out) if out.strip() else {}
+
+def pages(path):
+    """Every page of a list endpoint, flattened."""
+    return [x for page in json.loads(gh("api", "--paginate", "--slurp", "-H", "Accept: application/vnd.github+json", path)) for x in page]
 
 def repo_of(args):
     return args.repo or gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
@@ -71,15 +76,17 @@ def since(s):
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def read_body(args):
-    if args.body_file: return open(args.body_file).read()
+    if args.body_file:
+        try: return open(args.body_file).read()
+        except OSError as e: sys.exit(f"--body-file: {e}")
     if args.body is not None: return args.body
     sys.exit("need --body-file or --body")
 
 # ---------------- show ----------------
-SHOW = "number,state,isDraft,title,author,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,mergeCommit,reviewDecision,additions,deletions,changedFiles,comments,statusCheckRollup,updatedAt,url"
+SHOW = "number,state,isDraft,title,author,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,mergeCommit,reviewDecision,additions,deletions,changedFiles,statusCheckRollup,updatedAt,url"
 # ponytail: first 100 review threads only; `jx pr threads` pages through all of them
 TQ = """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){
- reviewThreads(first:100){nodes{isResolved}} commits(last:1){totalCount nodes{commit{committedDate}}}}}}"""
+ comments{totalCount} reviewThreads(first:100){nodes{isResolved}} commits(last:1){totalCount nodes{commit{committedDate}}}}}}"""
 
 def bucket(c):
     """One statusCheckRollup entry: a CheckRun has status + conclusion, a StatusContext has state."""
@@ -106,7 +113,7 @@ def cmd_show(args):
                "head": d["headRefName"], "head_sha": d["headRefOid"][:10], "base": d["baseRefName"], "mergeable": d["mergeable"], "merge_state": d["mergeStateStatus"],
                "merge_commit": (d["mergeCommit"] or {}).get("oid", "")[:10], "review": d["reviewDecision"], "+": d["additions"], "-": d["deletions"], "files": d["changedFiles"],
                "commits": g["commits"]["totalCount"], "checks": " ".join(f"{k}={b[k]}" for k in ("fail", "pending", "pass", "skip") if b[k]) or "none",
-               "unresolved": sum(not t["isResolved"] for t in g["reviewThreads"]["nodes"]), "comments": len(d["comments"]),
+               "unresolved": sum(not t["isResolved"] for t in g["reviewThreads"]["nodes"]), "comments": g["comments"]["totalCount"],
                "last_commit": last[0]["commit"]["committedDate"] if last else "", "updated": d["updatedAt"], "url": d["url"]}
         if args.body: row["body"] = d["body"]
         if args.files: row["file_list"] = [{"+": f["additions"], "-": f["deletions"], "path": f["path"]} for f in d["files"]]
@@ -120,11 +127,10 @@ def cmd_show(args):
 # ---------------- comments ----------------
 def cmd_comments(args):
     repo = repo_of(args)
-    # ponytail: first 100 comments and 100 reviews; page with `gh api --paginate` if a PR ever has more
     rows = [{"kind": "comment", "id": c["id"], "author": login(c["user"]), "created": c["created_at"], "state": "", "body": c["body"], "url": c["html_url"]}
-            for c in api(f"/repos/{repo}/issues/{args.n}/comments?per_page=100")]
+            for c in pages(f"/repos/{repo}/issues/{args.n}/comments?per_page=100")]
     rows += [{"kind": "review", "id": v["id"], "author": login(v["user"]), "created": v["submitted_at"], "state": v["state"], "body": v["body"], "url": v["html_url"]}
-             for v in api(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
+             for v in pages(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
              if v.get("submitted_at") and (v["body"] or v["state"] != "COMMENTED")]  # a bodiless COMMENTED review only wraps inline comments: `jx pr threads`
     rows.sort(key=lambda x: x["created"])
     if args.since:
@@ -208,15 +214,16 @@ def cmd_since(args):
     since_ = iso(since(args.since)) if args.since else None  # the ISO cut GitHub timestamps compare against as strings
     if not since_:
         me = gh("api", "user", "-q", ".login").strip()
-        reviews = api(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
-        others = [r["submitted_at"] for r in reviews if r.get("submitted_at") and r["user"]["login"] != me]
+        reviews = pages(f"/repos/{repo}/pulls/{args.n}/reviews?per_page=100")
+        others = [r["submitted_at"] for r in reviews if r.get("submitted_at") and login(r["user"]) != me]
         if not others: sys.exit("no review by someone else; pass --since ISO")
         since_ = max(others)
-    commits = api(f"/repos/{repo}/pulls/{args.n}/commits?per_page=250")
+    commits = pages(f"/repos/{repo}/pulls/{args.n}/commits?per_page=100")
     new = [c for c in commits if c["commit"]["committer"]["date"] > since_]
     rows = [{"sha": c["sha"][:10], "date": c["commit"]["committer"]["date"], "msg": c["commit"]["message"].splitlines()[0]} for c in new]
     sys.stderr.write(f"since {since_}: {len(new)} commits\n")
     if not new: return
+    if not new[0]["parents"]: sys.exit("the first new commit is a root commit: nothing to diff against; `jx pr show N --files` lists the whole PR")
     base = new[0]["parents"][0]["sha"]; head = new[-1]["sha"]
     cmp_ = api(f"/repos/{repo}/compare/{base}...{head}")
     files = [{"status": f["status"], "+": f["additions"], "-": f["deletions"], "file": f["filename"]} for f in cmp_.get("files", [])]

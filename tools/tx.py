@@ -31,8 +31,9 @@ def since(s):
 def records(path):
     with open(path, errors="replace") as fh:
         for line in fh:
-            try: yield json.loads(line)
-            except ValueError: continue
+            try: r = json.loads(line)
+            except (ValueError, RecursionError): continue
+            if isinstance(r, dict): yield r
 
 def text_of(rec, tools=True):
     """Plain text of a user/assistant record: text parts joined; tool_use and tool_result parts summarised (dropped when tools=False); thinking parts skipped."""
@@ -62,12 +63,16 @@ def session_summary(path):
     sid = os.path.basename(path)[:-6]; first = last = title = prompt = None; n = 0
     with open(path, errors="replace") as fh:
         for line in fh:
-            if '"type":"custom-title"' in line: title = json.loads(line).get("customTitle") or title; continue
+            if '"type":"custom-title"' in line or (prompt is None and '"type":"user"' in line):
+                try: rec = json.loads(line)  # the live session's last line can be half-written
+                except (ValueError, RecursionError): continue
+                if not isinstance(rec, dict): continue
+            if '"type":"custom-title"' in line: title = rec.get("customTitle") or title; continue
             if '"type":"user"' not in line and '"type":"assistant"' not in line: continue
             n += 1; m = TS_RX.search(line)
             if m: first = first or m.group(1); last = m.group(1)
             if prompt is None and '"type":"user"' in line and '"isSidechain":true' not in line and '"tool_result"' not in line:
-                txt = text_of(json.loads(line)).strip()
+                txt = text_of(rec).strip()
                 if txt and not txt.startswith("<"): prompt = txt.splitlines()[0][:100]
     return {"session": sid, "started": ts(first), "last": ts(last), "messages": n, "title": title or prompt or ""}
 
@@ -100,8 +105,8 @@ def messages(path, role, lit=None):
         for line in fh:
             if not any(w in line for w in want) or (lit and lit not in line.lower()): continue
             try: r = json.loads(line)
-            except ValueError: continue
-            if r.get("type") in ("user", "assistant"): yield r, r["type"]
+            except (ValueError, RecursionError): continue
+            if isinstance(r, dict) and r.get("type") in ("user", "assistant"): yield r, r["type"]
 
 def snippet(text, rx, n):
     for line in text.splitlines():

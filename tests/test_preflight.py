@@ -412,6 +412,31 @@ class HygieneAndRunnerTests(Base):
         self.assertIn("tests.mutate\tfull", p.stdout)
 
 
+class ParserTests(unittest.TestCase):
+    """The diff and CI-command parsers on the inputs that once fooled them."""
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import preflight, _preflight_static
+        cls.pf, cls.st = preflight, _preflight_static
+
+    def test_hunk_lines_that_look_like_file_headers_are_content(self):
+        diff = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,3 @@\n-a\n--- old comment\n-b\n+a\n+++ counter\n+b\n"
+        f, = self.pf.parse_diff(diff)
+        self.assertEqual((f.path, sorted(f.added), sorted(f.removed_old)), ("q.sql", [1, 2, 3], [1, 2, 3]))
+
+    def test_ci_commands_that_are_not_test_paths(self):
+        inv = lambda cmd: list(self.st.pytest_invocations(cmd))
+        self.assertEqual(inv("pip install pytest"), [])
+        self.assertEqual(inv("pytest -q tests 2>&1 | tee log.txt"), [("run", ["tests"], [])])
+        self.assertEqual(inv('pytest -m "not slow" --cov src tests > out.txt'), [("run", ["tests"], [])])
+
+    def test_ignore_of_a_file_or_a_slashed_directory_is_honoured(self):
+        wf = "jobs:\n  t:\n    steps:\n      - run: pytest tests --ignore=tests/test_b.py --ignore=tests/slow/\n"
+        uni = ["tests/test_a.py", "tests/test_b.py", "tests/slow/test_c.py"]
+        self.assertEqual(self.st.ci_selection([wf], uni, []), {"tests/test_a.py": "run"})
+
+
 class VendorTests(Base):
     """A repository's own copy of the engine: made by `vendor`, run without jx, and what jx runs there."""
 

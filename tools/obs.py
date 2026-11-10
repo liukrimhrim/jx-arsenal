@@ -71,11 +71,13 @@ def amp(env, path, params, method="POST"):
         hint = {403: f"wrong profile/region/workspace in {CFG}, or expired SSO (`jx aws -p {env['profile']} whoami`)",
                 400: "bad PromQL or selector; `jx obs <env> metrics <prefix>` lists real metric names, `jx obs <env> labels '<selector>'` real label names"}.get(e.code, "")
         sys.exit(f"AMP {e.code}: {msg}" + (f"\n→ {hint}" if hint else ""))
+    except OSError as e: sys.exit(f"AMP unreachable: {e}")  # DNS, no network, timeout
     if d.get("status") != "success": sys.exit(f"AMP: {d.get('errorType')}: {d.get('error')}")
     return d["data"]
 
 def loki(env, path, params):
     """GET a Loki API call on the env's Loki; returns the `data` field."""
+    if not env.get("loki"): sys.exit(f"no loki url for this env in {CFG}")
     url = f"{env['loki']}/loki/api/v1/{path}" + (f"?{urllib.parse.urlencode(params, doseq=True)}" if params else "")
     try:
         with urllib.request.urlopen(url, timeout=30) as r: d = json.load(r)
@@ -118,8 +120,9 @@ def cmd_q(a):
         emit(rows[:a.limit], ["metric", "labels", "points", "first", "last", "min", "max", "last_value"], a, d)
     else:
         d = amp(env, "query", {"query": a.query})
-        if d["resultType"] == "scalar": print(f"value\n{d['result'][1]}"); return
-        rows = [{"metric": r["metric"].get("__name__", ""), "labels": labels_str(r["metric"]), "time": iso(r["value"][0]), "value": r["value"][1]} for r in d["result"]]
+        if d["resultType"] in ("scalar", "string"): print(f"value\n{d['result'][1]}"); return
+        last = lambda r: r["value"] if "value" in r else r["values"][-1]  # `up[5m]` answers with a matrix: show each series' newest sample
+        rows = [{"metric": r["metric"].get("__name__", ""), "labels": labels_str(r["metric"]), "time": iso(last(r)[0]), "value": last(r)[1]} for r in d["result"]]
         emit(rows[:a.limit], ["metric", "labels", "time", "value"], a, d)
     sys.stderr.write(f"{len(d['result'])} series\n")
 
@@ -243,15 +246,17 @@ def main():
     sp.add_parser("doctor", parents=[g], help="config resolved, AMP reachable and signed, Loki reachable").set_defaults(f=cmd_doctor)
     a = ap.parse_args()
     if a.env != "all": a.f(a); return
-    first = True
+    first, failed = True, False
     for env in cfg():
         a.env = env; buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try: a.f(a)
-            except SystemExit as e: sys.stderr.write(f"[{env}] {e}\n"); continue
+            except SystemExit as e:
+                if e.code not in (None, 0): sys.stderr.write(f"[{env}] {e}\n"); failed = True; continue
         if a.json or a.cmd == "doctor": print(buf.getvalue(), end=""); continue
         lines = buf.getvalue().splitlines()
         if first and lines: print("env\t" + lines[0]); first = False
         for ln in lines[1:]: print(f"{env}\t{ln}")
+    if failed: sys.exit(1)
 
 if __name__ == "__main__": main()

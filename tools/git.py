@@ -14,7 +14,7 @@
   jx git touching <path ...> [-R owner/name]                  open PRs whose files overlap these paths (gh; exit 2 when unavailable)
   jx git doctor                                               toplevel, branch, upstream, ahead/behind, uncommitted, shallow, origin, main age
 
-Refs: `origin/<branch>` triggers `git fetch -q origin <branch>` first; `--pr N` fetches `pull/N/head` into `pr/N`.
+Refs: `origin/<branch>` triggers `git fetch -q origin <branch>` first; `--pr N` fetches `pull/N/head` into `refs/remotes/pr/N`.
 On a shallow clone where origin/main shares no history with HEAD, `since` falls back to the local `main` and says so.
 `commit` runs its guards before any write and verifies afterwards that the committed files are exactly the requested ones
 and (with --push) that origin's tip equals HEAD; every refusal is one line naming the tell and the fix.
@@ -23,7 +23,8 @@ import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 def git(*args, ok=(0,), stdin=None):
-    p = subprocess.run(["git", *args], text=True, capture_output=True, input=stdin)
+    # quotepath off: non-ASCII names come back as themselves, so they compare equal to the paths the caller passed
+    p = subprocess.run(["git", "-c", "core.quotepath=off", *args], text=True, errors="replace", capture_output=True, input=stdin)
     if p.returncode not in ok:
         err = p.stderr.strip() or p.stdout.strip()
         hint = ""
@@ -34,9 +35,9 @@ def git(*args, ok=(0,), stdin=None):
     return p.stdout
 
 def resolve(ref, pr):
-    """Make `ref` usable: fetch the branch behind origin/<b>, or fetch a PR head into pr/N. Returns the ref to use."""
-    if pr:
-        git("fetch", "-q", "origin", f"pull/{pr}/head:pr/{pr}"); return f"pr/{pr}"
+    """Make `ref` usable: fetch the branch behind origin/<b>, or fetch a PR head into refs/remotes/pr/N. Returns the ref to use."""
+    if pr:  # `+` and a remote-tracking ref: a force-pushed PR refetches, and no local branch is left behind
+        git("fetch", "-q", "origin", f"+pull/{pr}/head:refs/remotes/pr/{pr}"); return f"refs/remotes/pr/{pr}"
     m = re.fullmatch(r"origin/(.+)", ref)
     if m: git("fetch", "-q", "origin", m.group(1))
     return ref
@@ -65,7 +66,7 @@ def ranges(lines, spans, sep=True):
     """[lo, hi) spans as `N: line`, with `--` between spans that do not touch unless sep is False."""
     out, last = [], -1
     for lo, hi in sorted(spans):
-        lo = max(lo, last + 1)
+        lo, hi = max(lo, last + 1), min(hi, len(lines))
         if lo >= hi: continue
         if sep and out and lo > last + 1: out.append("--")
         out += [f"{k + 1}: {lines[k]}" for k in range(lo, hi)]; last = hi - 1
@@ -102,7 +103,7 @@ def cmd_cat(a):
 
 def cmd_ls(a):
     ref = resolve(a.ref, a.pr)
-    out = git("ls-tree", "--name-only", *(["-r"] if a.r else []), ref, a.path.rstrip("/") + ("/" if a.path.strip("/") else ""))
+    out = git("ls-tree", "--name-only", *(["-r"] if a.r else []), ref, *([a.path.rstrip("/") + "/"] if a.path.strip("/") else []))
     print(out, end="")
 
 def ctime(ref):
@@ -162,8 +163,9 @@ def rel_paths(paths, top):
     """User paths (relative to the shell cwd) → repo-relative, refusing anything outside or absent from both worktree and index."""
     out = []
     for p in paths:
-        r = os.path.normpath(os.path.relpath(os.path.abspath(p), top))
-        if r.startswith("..") or not (os.path.lexists(p) or git("ls-files", "--error-unmatch", "--", r, ok=(0, 1, 128)).strip()):
+        d, name = os.path.split(os.path.abspath(p))  # realpath the directory only: toplevel is resolved, and a tracked symlink must stay itself
+        r = os.path.normpath(os.path.relpath(os.path.join(os.path.realpath(d), name), top))
+        if r.startswith("..") or not (os.path.lexists(p) or git("-C", top, "ls-files", "--error-unmatch", "--", r, ok=(0, 1, 128)).strip()):
             sys.exit(f"{p}: no such path (shell cwd may have drifted; paths are relative to {top})")
         out.append(r)
     return out
@@ -191,7 +193,7 @@ def cmd_commit(a):
         if a.strict: sys.exit("--strict: refusing to commit beside foreign changes; commit or move them first (`jx git wt <name> --copy <path>`)")
     msg = read_message(a)
     git("add", "--", *paths)
-    git(*(["-c", "commit.gpgsign=false"] if a.no_sign else []), "commit", "-q", "-F", "-", stdin=msg)
+    git(*(["-c", "commit.gpgsign=false"] if a.no_sign else []), "commit", "-q", "-F", "-", "--", *paths, stdin=msg)  # pathspec = --only: whatever else is staged stays out
     sha = git("rev-parse", "HEAD").strip()
     files = [f for f in git("show", "--name-only", "--format=", "HEAD").split("\n") if f]
     stray = [f for f in files if not any(under(r, [f]) for r in paths)]
@@ -224,7 +226,7 @@ def cmd_wt(a):
         git("worktree", "remove", "--force", a.rm_dir); git("worktree", "prune"); print(f"removed {a.rm_dir}" + (f" (discarded {len(dirty)} changes)" if dirty else "")); return
     top = toplevel(); copies = rel_paths(a.copy, top)
     base = resolve(a.base, None); sha = git("rev-parse", base).strip()
-    d = os.path.normpath(os.path.abspath(a.dir or os.path.join(tempfile.gettempdir(), "jx-wt-" + a.name.replace("/", "-"))))
+    d = os.path.realpath(a.dir or os.path.join(tempfile.gettempdir(), "jx-wt-" + a.name.replace("/", "-")))
     git("worktree", "add", "-q", "-B", a.name, d, base)
     for r in copies:
         src, dst = os.path.join(top, r), os.path.join(d, r)

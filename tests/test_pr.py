@@ -13,7 +13,7 @@ import json, os, sys
 a = sys.argv[1:]; f = os.environ["FAKE_PR"]; pr = json.load(open(f))
 if a[:2] == ["pr", "view"]: print(json.dumps(pr)); sys.exit()
 if a[:2] == ["api", "graphql"]:
-    print(json.dumps({{"data": {{"repository": {{"pullRequest": {{"reviewThreads": {{"nodes": [{{"isResolved": False}}, {{"isResolved": True}}]}},
+    print(json.dumps({{"data": {{"repository": {{"pullRequest": {{"comments": {{"totalCount": 1}}, "reviewThreads": {{"nodes": [{{"isResolved": False}}, {{"isResolved": True}}]}},
         "commits": {{"totalCount": 3, "nodes": [{{"commit": {{"committedDate": "2026-11-07T08:00:00Z"}}}}]}}}}}}}}}})); sys.exit()
 if a[0] == "api" and a[-1] == "-":  # PATCH --input -
     change = json.load(sys.stdin)
@@ -23,7 +23,7 @@ print(json.dumps(pr))
 '''
 PR = {'number': 7, 'state': 'OPEN', 'isDraft': True, 'title': 'Old', 'body': 'old body', 'author': {'login': 'me'}, 'headRefName': 'b',
       'headRefOid': 'abcdef1234567890', 'baseRefName': 'main', 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'mergeCommit': None,
-      'reviewDecision': '', 'additions': 5, 'deletions': 1, 'changedFiles': 2, 'comments': [{}], 'updatedAt': 'x', 'url': 'u', 'html_url': 'u',
+      'reviewDecision': '', 'additions': 5, 'deletions': 1, 'changedFiles': 2, 'updatedAt': 'x', 'url': 'u', 'html_url': 'u',
       'statusCheckRollup': [{'__typename': 'CheckRun', 'status': 'COMPLETED', 'conclusion': 'FAILURE'},
                             {'__typename': 'CheckRun', 'status': 'IN_PROGRESS', 'conclusion': ''},
                             {'__typename': 'StatusContext', 'state': 'SUCCESS'},

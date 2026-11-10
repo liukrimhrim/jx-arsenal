@@ -39,6 +39,7 @@ def token(provider):
 
 def get(provider, path, params=None, all_pages=False):
     """GET one page, or every page when all_pages. incident.io pages with pagination_meta.after; PagerDuty with offset/more."""
+    if not path.startswith("/"): sys.exit(f"path must start with /: {path!r}")  # `@other.host/x` would send the token to other.host
     base = BASE[provider]; items, page_key = [], None
     params = dict(params or {})
     hdr = {"Authorization": f"Bearer {token(provider)}"} if provider == "incidentio" else {"Authorization": f"Token token={token(provider)}", "Accept": "application/vnd.pagerduty+json;version=2"}
@@ -114,14 +115,16 @@ def cmd_api(a):
     print(json.dumps(d, indent=1))
 
 def cmd_who(a):
-    at = a.at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"); rows = []
+    when = since(a.at) if a.at else datetime.now(timezone.utc); rows = []
+    at = when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if a.at: sys.stderr.write("--at applies to PagerDuty only; incident.io rows are who is on call now\n")
     io = get("incidentio", "/v2/schedules", {"page_size": 50}, True).get("schedules", [])
     for s in io:
         shifts = s.get("current_shifts") or []
         for sh in shifts:
             u = sh.get("user") or {}; rows.append({"provider": "incidentio", "schedule": s["name"], "user": u.get("name", ""), "email": u.get("email", ""), "until": ts(sh.get("end_at")), "layer": sh.get("rotation_id") or ""})
         if not shifts: rows.append({"provider": "incidentio", "schedule": s["name"], "user": "(nobody)", "email": "", "until": "", "layer": ""})
-    until = (datetime.fromisoformat(at.replace("Z", "+00:00")) + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = (when + timedelta(seconds=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     pd = get("pagerduty", "/oncalls", {"since": at, "until": until, "limit": 100, "include[]": ["users"]}, True).get("oncalls", [])
     for o in pd:
         if not o.get("schedule"): continue  # escalation-level entries without a schedule are the policy's static targets
@@ -254,12 +257,14 @@ def cmd_reconcile(a):
     sys.stderr.write(f"window {iso(floor)} .. now ({a.since}); `jx oncall incidents --since {a.since}` and `jx oncall alerts --since {a.since} --group` break these down\n")
 
 def cmd_doctor(a):
+    failed = False
     for p in ("incidentio", "pagerduty"):
         src = "env" if os.environ.get({"incidentio": "INCIDENTIO_API_KEY", "pagerduty": "PAGERDUTY_API_KEY"}[p]) else f"token_cmd in {CFG}"
         try:
             d = get(p, "/v2/users" if p == "incidentio" else "/users", {"page_size": 1} if p == "incidentio" else {"limit": 1})
             print(f"{p}\tok\tsource={src}\tusers_visible={'yes' if (d.get('users') or []) else 'no'}")
-        except SystemExit as e: print(f"{p}\tFAIL\t{str(e).splitlines()[0][:120]}")
+        except SystemExit as e: print(f"{p}\tFAIL\t{str(e).splitlines()[0][:120]}"); failed = True
+    if failed: sys.exit(1)
 
 def main():
     ap = argparse.ArgumentParser(prog="jx oncall", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

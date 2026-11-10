@@ -83,7 +83,7 @@ def die(message, code=2):
 
 def run(*cmd, ok=(0,)):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     except FileNotFoundError:
         die(f"`{cmd[0]}` not found on PATH; install it, then retry")
     if p.returncode not in ok:
@@ -92,7 +92,7 @@ def run(*cmd, ok=(0,)):
 
 
 def git(*args, ok=(0,)):
-    return run("git", *args, ok=ok).strip()
+    return run("git", "-c", "core.quotepath=off", *args, ok=ok).strip()  # non-ASCII paths unquoted: numstat rows are reused as pathspecs
 
 
 def exclusions():
@@ -174,7 +174,9 @@ def main():
     exclude = exclusions()
 
     pr = json.loads(run("gh", "pr", "view", str(args.pr), "--json", FIELDS))
-    owner, name = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/", pr["url"]).groups()
+    m = re.match(r"https://([^/]+)/([^/]+)/([^/]+)/pull/", pr["url"])
+    if not m: die(f"cannot read owner/name from PR url {pr['url']!r}")
+    host, owner, name = m.groups()
     head, base = pr["headRefOid"], pr["baseRefName"]
     out = Path(args.out or Path(tempfile.gettempdir()) / "review-prep" / owner / name / f"pr{args.pr}").resolve()
     if out.exists() and any(out.iterdir()) and not (out / MARKER).exists():
@@ -210,7 +212,7 @@ def main():
     print(f"url: {pr['url']}")
     print(f"state: {pr['state']}{' draft' if pr['isDraft'] else ''}  mergeable: {pr['mergeable']} {pr['mergeStateStatus']}")
     print(f"head: {head}  ({pr['headRefName']})")
-    print(f"Review-Key: github.com/{owner}/{name}@{head}")
+    print(f"Review-Key: {host}/{owner}/{name}@{head}")
     print(f"review exclusions: {json.dumps(exclude)}")
     checks = pr.get("statusCheckRollup") or []
     print("checks: " + ("; ".join(f"{c.get('workflowName') or c.get('context')}/{c.get('name', '')}="

@@ -34,12 +34,13 @@ NOT_FOUND = {
 }
 
 def sh(args, stdin=None, ok=(0,)):
-    try: p = subprocess.run(args, input=stdin, text=True, capture_output=True)
+    try: p = subprocess.run(args, input=stdin, text=True, errors="replace", capture_output=True)
     except FileNotFoundError: sys.exit("`gh` not found on PATH; install the GitHub CLI, then `gh auth login`")
     if p.returncode not in ok:
         err = p.stderr.strip() or p.stdout.strip()
-        if re.search(r"auth|login|token|401|403", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
-        elif re.search(r"404|not found|could not resolve", err, re.I): hint, code = "→ " + NOT_FOUND.get(CMD, "check the id"), 1
+        # not-found first, and auth only on gh's own phrasings: a run id containing 403 or a workflow named tokenizer.yml is not an auth failure
+        if re.search(r"HTTP 404|not found|could not resolve|could not find", err, re.I): hint, code = "→ " + NOT_FOUND.get(CMD, "check the id"), 1
+        elif re.search(r"HTTP 40[13]\b|gh auth login|authenticat|bad credentials", err, re.I): hint, code = "→ `gh auth status`; if logged out, `gh auth login`", 2
         else: hint, code = "", 1
         sys.stderr.write(f"{err}\n{hint}\n" if hint else err + "\n"); sys.exit(code)
     return p.stdout
@@ -63,6 +64,7 @@ def ids(arg, col):
     lines = [l.rstrip("\n") for l in sys.stdin if l.strip()]
     if not lines: sys.exit(f"no ids on stdin; expected a TSV with a {col} column (e.g. from `jx pr ci <n> --failed`)")
     head = lines[0].split("\t"); i = head.index(col) if col in head else 0
+    if len(lines) == 1 and col in head: sys.stderr.write("no ids on stdin (header only): nothing to do\n"); sys.exit(0)  # `jx pr ci N --failed | jx ci failed -` on a green PR
     out = []
     for l in lines[1:] if not lines[0].split("\t")[i].isdigit() else lines:
         v = l.split("\t")[i].strip()
@@ -126,18 +128,20 @@ def logs_one(lines, args):
     if args.grep:
         out, n = grep(lines, args.grep, args.C); print("\n".join(out)); sys.stderr.write(f"{n} hits in {len(lines)} lines\n")
     else:
-        print("\n".join(lines[-args.tail:])); sys.stderr.write(f"last {min(args.tail, len(lines))} of {len(lines)} lines\n")
+        print("\n".join(lines[-args.tail:] if args.tail > 0 else [])); sys.stderr.write(f"last {min(args.tail, len(lines))} of {len(lines)} lines\n")
 
 def cmd_failed(args):
     repo = repo_of(args); bad = []
     for rid in ids(args.run_id, "run_id"): bad += [j for j in jobs_of(rid, args.attempt, repo) if j["conclusion"] in ("failure", "timed_out", "cancelled")]
     if not bad: sys.stderr.write("no failed jobs\n"); return
+    real = any(j["conclusion"] != "cancelled" for j in bad)
     for j in bad:
         print(f"=== {j['name']}  job {j['id']}  {j['conclusion']}  attempt {j['run_attempt']}  {j['html_url']}")
+        if real and j["conclusion"] == "cancelled": print(f"(cancelled beside a real failure; `jx ci logs {j['id']}` reads its log)\n"); continue  # fail-fast siblings: N downloads that all say "canceled"
         steps = [s["name"] for s in j.get("steps", []) if s["conclusion"] == "failure"]
         if steps: print(f"failed steps: {', '.join(steps)}")
         out, n = grep(job_log(j["id"], repo), args.grep, args.C)
-        print("\n".join(out[-args.max_lines:]) if out else "(no matching lines; try --grep or `jx ci logs <job-id>`)"); print()
+        print("\n".join(out[-args.max_lines:] if args.max_lines > 0 else []) if out else "(no matching lines; try --grep or `jx ci logs <job-id>`)"); print()
     sys.exit(1)
 
 # ---------------- timings ----------------
@@ -193,7 +197,6 @@ def cmd_wait(args):
     sys.exit(rc)
 
 def cmd_dispatch(args):
-    repo = repo_of(args)
     ref = args.ref or sh(["git", "branch", "--show-current"]).strip()
     t0 = datetime.now(timezone.utc).isoformat()
     a = ["workflow", "run", args.workflow, "--ref", ref] + R(args)

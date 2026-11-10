@@ -23,6 +23,7 @@ Filters compose into a visibility query: WorkflowType, ExecutionStatus, TaskQueu
 import argparse, contextlib, io, json, os, re, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timedelta, timezone
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # a harness timeout must still unwind forward(), or its port-forward is orphaned
 CFG = os.path.expanduser("~/.config/jx-arsenal/temporal.json")
 
 def env_of(name):
@@ -281,15 +282,17 @@ def main():
     for b in ("kubectl", "temporal"):
         if not shutil.which(b): sys.exit(f"`{b}` not found on PATH; install it, then `jx temporal <env> doctor`")
     if a.env != "all": a.f(a); return
-    first = True
+    first, failed = True, False
     for env in all_envs():
         a.env = env; buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try: a.f(a)
-            except SystemExit as e: sys.stderr.write(f"[{env}] {e}\n"); continue
+            except SystemExit as e:
+                if e.code not in (None, 0): sys.stderr.write(f"[{env}] {e}\n"); failed = True; continue
         lines = buf.getvalue().splitlines()
         if a.json or a.cmd == "doctor": print(buf.getvalue(), end=""); continue
         if first and lines: print("env\t" + lines[0]); first = False
         for ln in lines[1:]: print(f"{env}\t{ln}")
+    if failed: sys.exit(1)
 
 if __name__ == "__main__": main()
