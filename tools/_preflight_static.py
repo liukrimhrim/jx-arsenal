@@ -99,7 +99,8 @@ def env_reads(tree):
             if cn in ("os.getenv", "getenv") or (isinstance(f, ast.Attribute) and f.attr in ("get", "pop", "setdefault")
                                                  and re.search(r"environ|\benv\b", ast.unparse(f.value))):
                 name = n.args[0].value
-        elif isinstance(n, ast.Subscript) and re.search(r"environ", ast.unparse(n.value)) and isinstance(n.slice, ast.Constant):
+        elif (isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Load)  # `os.environ["X"] = ...` sets X for a child: no read
+              and re.search(r"environ", ast.unparse(n.value)) and isinstance(n.slice, ast.Constant)):
             name = n.slice.value if isinstance(n.slice.value, str) else None
         if name and re.fullmatch(r"[A-Z][A-Z0-9_]{3,}", name): out.setdefault(name, n.lineno)
     return out
@@ -124,14 +125,15 @@ def refs_removed(ctx):
         ht = ctx.tree(f.path) if f.status != "D" else None
         mod = stem(f.old_path)
         defined_elsewhere = names_elsewhere(ctx, f.path)
+        # A name the module only imported is importable from it, so a use through the module still breaks. A bare
+        # mention elsewhere is that file's own import of the same thing: dropping `import json` here is not its concern.
+        passed_on = top_names(bt) - top_names(bt, imports=False)
         for name in sorted(top_names(bt) - top_names(ht) - defined_elsewhere):
             if len(name) < 4 or name.startswith("__"): continue
             rx = re.compile(rf"\b{re.escape(name)}\b")
-            for p, i, line in itertools.islice(lines_matching(ctx, rx, skip={f.path}), 8):
-                sev = "warn"
-                if p.endswith(".py") and (re.search(rf"\b{re.escape(mod)}\.{re.escape(name)}\b", line) or
-                                          re.search(rf"\bfrom\s+[\w.]*\b{re.escape(mod)}\s+import\b.*\b{re.escape(name)}\b", line)):
-                    sev = "block"
+            through = re.compile(rf"\b{re.escape(mod)}\.{re.escape(name)}\b|\bfrom\s+[\w.]*\b{re.escape(mod)}\s+import\b.*\b{re.escape(name)}\b")
+            hits = ((p, i, "block" if p.endswith(".py") and through.search(line) else "warn") for p, i, line in lines_matching(ctx, rx, skip={f.path}))
+            for p, i, sev in itertools.islice((h for h in hits if h[2] == "block" or name not in passed_on), 8):
                 yield p, i, f"`{name}` was removed from {f.old_path} but is still referenced here", sev
         for kind, old, new in (("env var", env_reads(bt), env_reads(ht)), ("CLI flag", cli_flags(bt), cli_flags(ht))):
             for name in sorted(set(old) - set(new)):
