@@ -353,6 +353,14 @@ class HygieneAndRunnerTests(Base):
         self.assertEqual(code, 1)
         self.assertEqual(sorted((x["check"], x["path"], x["line"]) for x in rows), [("hygiene.secrets", "conf.py", 1), ("scope.owned", "other/x.txt", "")])
 
+    def test_only_and_skip_select_pack_checks_as_they_do_jx_checks(self):
+        pack = 'print("pack.demo\\tblock\\ta.py\\t1\\tdemo finding\\tPR 1")\n'
+        r = self.repo({"a.py": "x = 1\n", ".jx/pack.py": pack, ".jx/preflight.json": json.dumps({"checks": [{"id": "pack.demo", "cmd": "python3 .jx/pack.py", "when": ["*.py"]}]})})
+        r.commit({"a.py": "x = 2\n"})
+        self.assertEqual(r.run("--only", "pack.demo")[0], 1)
+        self.assertEqual(r.run("--only", "pack.demo", "--skip", "pack.demo")[:2], (0, []))
+        self.assertEqual(r.run("--only", "pack.*,hygiene.diff-check", "--skip", "pack.*")[:2], (0, []))
+
     def test_dispositions_and_pack_contract(self):
         pack = 'import json, sys\nc = json.load(open(sys.argv[1]))\nprint("pack.demo\\tblock\\t" + c["files"][0]["path"] + "\\t1\\tdemo finding\\tPR 1")\n'
         r = self.repo({"a.py": "x = 1\n", ".jx/pack.py": pack, ".jx/preflight.json": json.dumps({"checks": [{"id": "pack.demo", "cmd": "python3 .jx/pack.py", "when": ["*.py"]}]})})
@@ -453,6 +461,21 @@ class VendorTests(Base):
         own = self.jx(r, "ls", env={"JX_PREFLIGHT_OWN": "1"})
         self.assertIn("refs.removed\t", own.stdout)
         self.assertEqual(self.jx(r, "vendor", "--dry-run", "--allow-dirty").stdout.count("\tupdate"), 1)  # vendor stays jx's own
+
+    def test_the_test_python_command_gets_only_what_is_left_of_the_budget(self):
+        r = self.repo({"a.py": "x = 1\n"})
+        code = ("import argparse, sys, time\nsys.path.insert(0, sys.argv[1])\nimport preflight as p\n"
+                "args = argparse.Namespace(base='main', body=None, pr=None, budget=1)\n"
+                "c = p.Change(sys.argv[3], args, {**p.DEFAULTS, 'test_python': sys.argv[2]})\n"
+                "c.deadline = time.time() + 1\n"
+                "for _ in range(2):\n"
+                "    try: print(c.test_python())\n"
+                "    except p.Skipped as e: print('skipped:', e)\n")
+        slow = f"{sys.executable} -c 'import time; time.sleep(30)'"  # a cold `jx venv path` builds an environment
+        began = time.monotonic()
+        out = subprocess.run([sys.executable, "-c", code, str(ROOT / "tools"), slow, str(r.path)], cwd=r.path, text=True, capture_output=True).stdout
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual(out.count("skipped: the test python command did not finish within the run's 1 s budget"), 2, out)  # asked twice, waited once
 
     def test_a_machine_without_the_test_python_command_uses_the_fallback(self):
         r = self.repo({"a.py": "x = 1\n", "venv/bin/python": "#!/bin/sh\n"})

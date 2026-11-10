@@ -70,7 +70,8 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
     is a worktree, made in parallel). The baseline is split across all of them, and a mutant's tests run fastest
     first, so `-x` reaches a kill soonest. An integer constant is mutated only where it is a comparison's boundary.
   - **Budget.** The whole run ends within `--budget` seconds (default 60). The full-tier checks and the pack scripts
-    start together. One still running when the budget ends is stopped and says what it left undone; a pack script
+    start together. The `test_python` command gets what is left of it: a cold one that builds an environment is
+    stopped there, and the checks that need it say to run it once first. One still running when the budget ends is stopped and says what it left undone; a pack script
     reads `deadline` (epoch seconds) from `change.json` to stop in time. Mutation keeps its verdicts and its
     baseline, so the next run goes on from where this one stopped.
   - **Reused verdicts.** Each full run records every mutant's verdict in the receipt (killed, survived, or unknown
