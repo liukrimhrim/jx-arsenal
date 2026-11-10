@@ -118,6 +118,26 @@ def cli_flags(tree):
 
 # ---------------------------------------------------------------- A. the change's reach outside the diff
 
+def binds_module(ctx, p, path):
+    """Whether file p imports the module at `path` under its own name, so that `stem.name` in p reads that module and
+    not a file called `stem.json` or another object's attribute."""
+    mod, cache = stem(path), ctx.__dict__.setdefault("_binds_module", {})
+    if (p, path) not in cache:
+        found = False
+        for n in ast.walk(ctx.tree(p) or ast.Module(body=[], type_ignores=[])):
+            if isinstance(n, ast.Import):
+                found |= any(a.name.rsplit(".", 1)[-1] == mod and a.asname in (None, mod) for a in n.names)
+            elif isinstance(n, ast.ImportFrom) and any(a.name == mod and a.asname in (None, mod) for a in n.names):
+                tail = [*filter(None, [(n.module or "").replace(".", "/")]), mod + ".py"]
+                if n.level:  # relative: from the importing file's package, `level - 1` folders up
+                    here = p.split("/")[:-1]
+                    found |= path == "/".join([*here[:len(here) - (n.level - 1)], *tail])
+                else:
+                    found |= ("/" + path).endswith("/" + "/".join(tail))
+        cache[(p, path)] = found
+    return cache[(p, path)]
+
+
 def refs_removed(ctx):
     for f in ctx.changed(".py", statuses="MDR"):
         bt = ctx.base_tree(f.path)
@@ -131,8 +151,11 @@ def refs_removed(ctx):
         for name in sorted(top_names(bt) - top_names(ht) - defined_elsewhere):
             if len(name) < 4 or name.startswith("__"): continue
             rx = re.compile(rf"\b{re.escape(name)}\b")
-            through = re.compile(rf"\b{re.escape(mod)}\.{re.escape(name)}\b|\bfrom\s+[\w.]*\b{re.escape(mod)}\s+import\b.*\b{re.escape(name)}\b")
-            hits = ((p, i, "block" if p.endswith(".py") and through.search(line) else "warn") for p, i, line in lines_matching(ctx, rx, skip={f.path}))
+            attr = re.compile(rf"\b{re.escape(mod)}\.{re.escape(name)}\b")
+            imported = re.compile(rf"\bfrom\s+[\w.]*\b{re.escape(mod)}\s+import\b.*\b{re.escape(name)}\b")
+            def through(p, line):  # `from mod import name`, or `mod.name` in a file that imports mod
+                return p.endswith(".py") and bool(imported.search(line) or attr.search(line) and binds_module(ctx, p, f.old_path))
+            hits = ((p, i, "block" if through(p, line) else "warn") for p, i, line in lines_matching(ctx, rx, skip={f.path}))
             for p, i, sev in itertools.islice((h for h in hits if h[2] == "block" or name not in passed_on), 8):
                 yield p, i, f"`{name}` was removed from {f.old_path} but is still referenced here", sev
         for kind, old, new in (("env var", env_reads(bt), env_reads(ht)), ("CLI flag", cli_flags(bt), cli_flags(ht))):
