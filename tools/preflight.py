@@ -8,6 +8,8 @@ names the past review miss it came from; `jx preflight ls` prints the catalogue.
                                                             disposition; exit 1 while a block (or, with --strict, an ask) is open
   jx preflight ls                                           every check: id, tier, severity, origin, what it finds
   jx preflight doctor                                       git, base ref, repo config, pack scripts, test python
+  jx preflight vendor [--dry-run] [--allow-dirty]           copy this engine into the repo as .jx/preflight/engine/, so
+                                                            the checks run there with python and git alone
 
 Severity: block = definite defect; warn = likely defect, look at it; ask = needs a written disposition; info = summary.
 Scope: the diff is merge-base(--base, HEAD) against the working tree, plus untracked files. Searches run over the "live
@@ -26,6 +28,11 @@ or a standing line `- <check-glob> <path-glob>: <reason>` in the repo's disposit
 the run. Repo config: `.jx/preflight.json` (frozen_lists, excludes, governing_docs, test_commands, test_python,
 ci_only_dirs, status_vocab, secret_allow, dispositions, checks). `checks` lists repo-pack scripts run as
 `<cmd> OUT/change.json`; each prints rows `check<TAB>severity<TAB>path<TAB>line<TAB>message<TAB>origin`.
+A repository's copy: `vendor` writes this file, the two check modules and ENGINE.json (the jx commit and each file's
+sha256) to .jx/preflight/engine/. `python3 .jx/preflight/engine/preflight.py run` then works without jx. Inside such a
+repository `jx preflight` hands every command but `vendor` to that copy, so everyone runs one version;
+JX_PREFLIGHT_OWN=1 runs jx's own instead. A copy that no longer matches its ENGINE.json refuses to run: it is replaced
+as a whole with `vendor`, never edited.
 """
 import argparse, fnmatch, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
@@ -36,8 +43,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 if __name__ == "__main__": sys.modules["preflight"] = sys.modules[__name__]  # else the checks' `from preflight import` makes a second copy whose Missing/Skipped escape main's except clauses
 SEVERITIES = ("block", "warn", "ask", "info")
 HEADER = ["id", "check", "severity", "path", "line", "message", "origin", "disposition"]
+ENGINE = ("preflight.py", "_preflight_static.py", "_preflight_dynamic.py")  # what `vendor` copies; ENGINE.json beside them marks a copy
+PROG = os.environ.get("PREFLIGHT_PROG") or "jx preflight"  # the command the hints name; a repository's wrapper around its copy sets it
 DEFAULTS = {"frozen_lists": [], "excludes": [".claude/worktrees/**", "node_modules/**", ".venv*/**"], "governing_docs": [],
-            "test_commands": [], "test_python": "", "ci_only_dirs": [], "status_vocab": ["pass", "fail", "pending"],
+            "test_commands": [], "test_python": "", "test_python_fallback": "", "ci_only_dirs": [], "status_vocab": ["pass", "fail", "pending"],
             "secret_allow": [], "dispositions": ".jx/preflight/DISPOSITIONS.md", "checks": [], "workers": 2}
 
 
@@ -239,11 +248,21 @@ class Change:
         return [(n, lines[n - 1]) for n in sorted(f.added) if 0 < n <= len(lines)] if f else []
 
     def test_python(self):
-        """The python that runs the repo's tests: `test_python` (a command printing the path) or this interpreter."""
+        """The python that runs the repo's tests: $PREFLIGHT_TEST_PYTHON; else `test_python`, a command printing the
+        path; else, where that command's program is not installed, `test_python_fallback`, a path in the repo; else
+        this interpreter."""
         if not hasattr(self, "_test_python"):
-            cmd = self.config.get("test_python")
-            if cmd:
-                p = run(shlex.split(cmd), cwd=self.root, check=False, timeout=1800)
+            cmd, spare = self.config.get("test_python"), self.config.get("test_python_fallback")
+            argv = shlex.split(cmd) if cmd else []
+            if os.environ.get("PREFLIGHT_TEST_PYTHON"):
+                self._test_python = os.environ["PREFLIGHT_TEST_PYTHON"]
+            elif argv and spare and not shutil.which(argv[0]):
+                if not (self.root / spare).is_file():
+                    raise Skipped(f"no test python: `{argv[0]}` is not on PATH and {spare} does not exist; build it, or "
+                                  "set PREFLIGHT_TEST_PYTHON")
+                self._test_python = str(self.root / spare)
+            elif cmd:
+                p = run(argv, cwd=self.root, check=False, timeout=1800)
                 path = (p.stdout.strip().splitlines() or [""])[-1]
                 if p.returncode or not path: raise RuntimeError(f"test_python command failed: {cmd}: {p.stderr.strip()[:300]}")
                 self._test_python = path
@@ -301,7 +320,7 @@ def load_config(root, path=None):
     if path and not p.is_file(): sys.exit(f"{p}: no such config file")
     if p.is_file():
         try: user = json.loads(p.read_text())
-        except (ValueError, RecursionError) as e: sys.exit(f"{p}: invalid JSON ({e}); fix it, then `jx preflight doctor`")
+        except (ValueError, RecursionError) as e: sys.exit(f"{p}: invalid JSON ({e}); fix it, then `{PROG} doctor`")
         if not isinstance(user, dict): sys.exit(f"{p}: expected a JSON object")
         cfg.update(user)
         if "excludes" in user: cfg["excludes"] = list(dict.fromkeys(DEFAULTS["excludes"] + list(user["excludes"])))
@@ -373,7 +392,7 @@ def selected(checks, a):
 
 def toplevel():
     p = run(["git", "rev-parse", "--show-toplevel"], check=False)
-    if p.returncode: sys.exit("preflight: not inside a git repository; cd into the checkout, then `jx preflight run`")
+    if p.returncode: sys.exit(f"preflight: not inside a git repository; cd into the checkout, then `{PROG} run`")
     return p.stdout.strip()
 
 
@@ -495,10 +514,10 @@ def cmd_ls(a):
 def cmd_doctor(a):
     rows, bad = [], False
     if not shutil.which("git"):
-        print("git: not found on PATH; install git, then `jx preflight doctor`", file=sys.stderr); return 1
+        print(f"git: not found on PATH; install git, then `{PROG} doctor`", file=sys.stderr); return 1
     p = run(["git", "rev-parse", "--show-toplevel"], check=False)
     if p.returncode:
-        print("preflight: not inside a git repository; cd into the checkout, then `jx preflight doctor`", file=sys.stderr); return 1
+        print(f"preflight: not inside a git repository; cd into the checkout, then `{PROG} doctor`", file=sys.stderr); return 1
     root = p.stdout.strip()
     rows.append(dict(item="repo", state="ok", detail=root))
     base = run(["git", "-C", root, "rev-parse", "--verify", f"{a.base}^{{commit}}"], check=False)
@@ -516,10 +535,14 @@ def cmd_doctor(a):
         script = next((c for c in cmd if c.endswith(".py")), None)
         ok = script is None or (Path(root) / script).is_file(); bad |= not ok
         rows.append(dict(item=f"pack {spec.get('id', '?')}", state="ok" if ok else "missing", detail=" ".join(cmd)))
-    tp = config.get("test_python")
+    tp, spare = config.get("test_python"), config.get("test_python_fallback")
     exe = shlex.split(tp)[0] if tp else sys.executable
     found = shutil.which(exe) or (Path(exe).is_file() and exe)
-    rows.append(dict(item="test_python", state="ok" if found else "missing", detail=tp or f"{sys.executable} (default)"))
+    detail = tp or f"{sys.executable} (default)"
+    if not found and spare:  # a machine without the command's program uses the fallback path, if it was built
+        found = (Path(root) / spare).is_file()
+        detail = f"{spare} (`{exe}` is not on PATH)" if found else f"`{exe}` is not on PATH and {spare} does not exist; build it, or set PREFLIGHT_TEST_PYTHON"
+    rows.append(dict(item="test_python", state="ok" if found else "missing", detail=detail))
     import _preflight_dynamic
     why = _preflight_dynamic.sandbox_problem()
     rows.append(dict(item="sandbox", state="missing" if why else "ok", detail=why or "--full test runs cannot signal outside their own tree"))
@@ -530,8 +553,74 @@ def cmd_doctor(a):
     return 1 if bad else 0
 
 
+def pinned():
+    """Refuse to run as a repository's copy that no longer matches its ENGINE.json."""
+    here = Path(__file__).resolve().parent
+    try:
+        want = json.loads((here / "ENGINE.json").read_text())["files"]
+        changed = [n for n in ENGINE if hashlib.sha256((here / n).read_bytes()).hexdigest() != want[n]]
+    except FileNotFoundError:
+        return  # jx's own engine, or a copy with a file missing, which fails on its import
+    except (ValueError, KeyError, TypeError, RecursionError) as e:
+        sys.exit(f"preflight: {here / 'ENGINE.json'} does not read ({type(e).__name__}: {e}); take a new copy with `jx preflight vendor`")
+    if changed:
+        sys.exit(f"preflight: {', '.join(changed)} in {here} no longer match ENGINE.json. This copy of jx's preflight engine is "
+                 f"replaced as a whole, never edited: restore it with `git checkout -- {here}`, or take a new one with "
+                 "`jx preflight vendor` from a jx checkout")
+
+
+def repo_copy():
+    """The engine copy this repository pins, unless this file is it or JX_PREFLIGHT_OWN is set."""
+    try:
+        p = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    except Missing:
+        return None
+    copy = Path(p.stdout.strip()) / ".jx" / "preflight" / "engine" / "preflight.py"
+    if p.returncode or os.environ.get("JX_PREFLIGHT_OWN") or not copy.is_file() or copy.resolve() == Path(__file__).resolve():
+        return None
+    return copy
+
+
+def cmd_vendor(a):
+    """Copy the engine into this repository as .jx/preflight/engine/, with ENGINE.json: the jx commit and each file's sha256."""
+    src, root = Path(__file__).resolve().parent, Path(toplevel())
+    if (src / "ENGINE.json").is_file():
+        sys.exit("preflight: this is a repository's copy of the engine; run `jx preflight vendor` from a jx checkout")
+    state = run(["git", "-C", str(src), "status", "--porcelain", "--", *ENGINE], check=False)
+    dirty = state.returncode == 0 and bool(state.stdout.strip())
+    if dirty and not a.allow_dirty:
+        sys.exit(f"preflight: the engine in {src} has uncommitted changes, and ENGINE.json names the commit a copy came "
+                 "from. Commit them, then `jx preflight vendor` (or --allow-dirty to try a copy first)")
+    commit = git(src, "rev-parse", "HEAD").strip() + ("+dirty" if dirty else "") if state.returncode == 0 else None
+    origin = run(["git", "-C", str(src), "remote", "get-url", "origin"], check=False).stdout.strip() if commit else ""
+    files = {n: (src / n).read_bytes() for n in ENGINE}
+    manifest = dict(_doc="A copy of jx's preflight engine. Never edit these files: replace them with `jx preflight vendor`.",
+                    source=re.sub(r"^git@([^:]+):(.+?)(?:\.git)?$", r"https://\1/\2", origin), commit=commit,
+                    files={n: hashlib.sha256(b).hexdigest() for n, b in files.items()})
+    files["ENGINE.json"] = (json.dumps(manifest, indent=1) + "\n").encode()
+    dest, rows = root / ".jx" / "preflight" / "engine", []
+    for name, data in files.items():
+        old = (dest / name).read_bytes() if (dest / name).is_file() else None
+        rows.append(dict(file=str((dest / name).relative_to(root)), state="same" if old == data else "new" if old is None else "update"))
+        if old != data and not a.dry_run:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / name).write_bytes(data)
+    if a.json: print(json.dumps(rows, indent=1))
+    else:
+        print("file\tstate")
+        for r in rows: print(f"{r['file']}\t{r['state']}")
+    todo = sum(r["state"] != "same" for r in rows)
+    print(f"preflight: engine at {commit or 'an unknown commit'}; {todo} file(s) {'would change' if a.dry_run else 'written'} in {dest}"
+          + ("" if a.dry_run or not todo else f"; run it there with `python3 {dest.relative_to(root)}/preflight.py run`"), file=sys.stderr)
+    return 0
+
+
 def main():
-    parser = argparse.ArgumentParser(prog="jx preflight", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    pinned()
+    copy = repo_copy()
+    if copy and sys.argv[1:2] != ["vendor"]:  # the repository pins its engine: everyone there runs that one
+        os.execv(sys.executable, [sys.executable, str(copy), *sys.argv[1:]])
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="raw JSON instead of TSV")
     sub = parser.add_subparsers(dest="cmd", required=True, metavar="<command>")
@@ -559,12 +648,15 @@ def main():
     d = sub.add_parser("doctor", parents=[common], help="git, base ref, config, pack scripts, test python, sandbox")
     d.add_argument("--base", default="origin/main", help="base ref to resolve (default origin/main)")
     d.add_argument("--config", help="config file to check instead of the repo's .jx/preflight.json")
+    v = sub.add_parser("vendor", parents=[common], help="copy this engine into the repository as .jx/preflight/engine/")
+    v.add_argument("--dry-run", action="store_true", help="say which files would change, write nothing")
+    v.add_argument("--allow-dirty", action="store_true", help="copy an engine with uncommitted changes; ENGINE.json says so")
     a = parser.parse_args()
     a.json = getattr(a, "json", False)
     try:
-        sys.exit({"run": cmd_run, "ls": cmd_ls, "doctor": cmd_doctor}[a.cmd](a))
+        sys.exit({"run": cmd_run, "ls": cmd_ls, "doctor": cmd_doctor, "vendor": cmd_vendor}[a.cmd](a))
     except Missing as e:
-        sys.exit(f"{e}: not found on PATH; install it, then `jx preflight doctor`")
+        sys.exit(f"{e}: not found on PATH; install it, then `{PROG} doctor`")
     except RuntimeError as e:
         sys.exit(f"preflight: {e}")
 
