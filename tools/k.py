@@ -15,7 +15,9 @@
   {"envs": {"prod": {"context": "arn:aws:eks:...:cluster/x"}, "stage": {"context": "stage-cluster"}}}
 The file also defines the env list `jx k all` uses. Nothing cluster-specific lives in this script.
 """
-import argparse, base64, contextlib, io, json, os, re, shutil, subprocess, sys, signal
+import argparse, base64, json, os, re, shutil, subprocess, sys, signal
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _fanout import fan_out
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timezone
 
@@ -50,7 +52,7 @@ def check_ns(env, ns):
 def kubectl(args, env, ns=None, all_ns=False, ok=(0,), timeout=None):
     # namespace flags go AFTER the verb: kubectl treats a leading -A as a plugin name
     cmd = ["kubectl", "--context", context_of(env), "--request-timeout", "20s"] + args + (["-A"] if all_ns else ["-n", ns] if ns else [])
-    timeout = timeout or int(os.environ.get("K_TIMEOUT", "45"))
+    timeout = int(os.environ.get("K_TIMEOUT", "45")) if timeout is None else timeout or None  # 0: no limit
     try: p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:  # kubectl's discovery retries ignore --request-timeout; bound the whole call
         sys.exit(f"{env}: no answer in {timeout}s (VPN/tailnet down? wrong context?)  → run `jx k {env} doctor`")
@@ -189,9 +191,16 @@ def cmd_logs(args):
         last = hi - 1
     sys.stderr.write(f"{len(hits)} hits in {len(lines)} lines\n")
 
+def go_seconds(s):
+    """Seconds in a kubectl duration (`300s`, `1m30s`, `1.5m`, `0`); None when it is not one, which kubectl then rejects itself."""
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|[hms])", s)
+    if s.strip("0.") == "": return 0
+    if not parts or "".join(n + u for n, u in parts) != s: return None
+    return sum(float(n) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[u] for n, u in parts)
+
 def cmd_rollout(args):
-    m = re.fullmatch(r"(\d+)([smh]?)", args.timeout)  # outlive kubectl's own --timeout, so its message is the one that surfaces
-    wait = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)] + 30 if m else None
+    wait = go_seconds(args.timeout)
+    if wait: wait += 30  # outlive kubectl's own --timeout, so its message is the one that surfaces; 0 stays unlimited, like kubectl's
     print(kubectl(["rollout", "status", args.target, "--timeout", args.timeout], args.env, args.n, timeout=wait).strip())
 
 def cmd_secret(args):
@@ -231,17 +240,6 @@ def main(argv=None):
     if not shutil.which("kubectl"): sys.exit("`kubectl` not found on PATH; install it, then `jx k <env> doctor`")
     if args.env != "all": args.f(args); return
     if args.cmd in ("secret", "logs", "rollout"): sys.exit(f"`jx k all {args.cmd}` not supported; one env at a time")
-    first, failed = True, False
-    for env in all_envs():
-        args.env = env; buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try: args.f(args)
-            except SystemExit as e:
-                if e.code not in (None, 0): sys.stderr.write(f"[{env}] {e}\n"); failed = True; continue
-        lines = buf.getvalue().splitlines()
-        if args.json: print(buf.getvalue()); continue
-        if first and lines: print("env\t" + lines[0]); first = False
-        for ln in lines[1:]: print(f"{env}\t{ln}")
-    if failed: sys.exit(1)
+    fan_out(all_envs(), args)
 
 if __name__ == "__main__": main()

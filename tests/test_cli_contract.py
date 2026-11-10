@@ -1,6 +1,7 @@
 """Contract every tool must keep: help on every argument, --json after the subcommand, --dry-run on writers,
 one --since grammar, a health subcommand, and stdin `-` where the command takes an id."""
 import argparse
+import contextlib
 import importlib.util
 import io
 import subprocess
@@ -119,6 +120,28 @@ class Contract(unittest.TestCase):
 
     def test_git_wt_rm_has_force(self):
         self.assertTrue(any("--force" in a.option_strings for a in self.subs["git"]["wt"]._actions))
+
+
+class FanOut(unittest.TestCase):
+    """`jx <tool> all`: one failing env does not stop the rest but fails the call; a termination signal stops it at once."""
+    def run_all(self, codes):
+        sys.path.insert(0, str(ROOT / "tools"))
+        from _fanout import fan_out
+        seen = []
+        def f(a):
+            seen.append(a.env); print("h\nrow")
+            if codes.get(a.env) is not None: sys.exit(codes[a.env])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as e:
+            fan_out(["a", "b", "c"], argparse.Namespace(f=f, json=False))
+        return seen, e.exception.code, out.getvalue()
+
+    def test_a_failed_env_is_skipped_and_the_exit_code_says_so(self):
+        self.assertEqual(self.run_all({"b": "boom"}), (["a", "b", "c"], 1, "env\th\na\trow\nc\trow\n"))
+
+    def test_sigterm_ends_the_loop(self):
+        seen, code, _ = self.run_all({"a": 143})
+        self.assertEqual((seen, code), (["a"], 143))
 
 
 if __name__ == "__main__":
