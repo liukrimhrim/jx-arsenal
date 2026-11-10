@@ -6,6 +6,7 @@ names the past review miss it came from; `jx preflight ls` prints the catalogue.
       [--budget 60] [--mutate-all] [--owned GLOB ...] [--readonly GLOB ...] [--ledger FILE] [--only ID,..] [--skip ID,..]
       [--strict] [--out DIR] [--dry-run]                    findings TSV: id, check, severity, path, line, message, origin,
                                                             disposition; exit 1 while a block (or, with --strict, an ask) is open
+                                                            --only and --skip take ids or globs, of jx's checks and the repo pack's alike
   jx preflight ls                                           every check: id, tier, severity, origin, what it finds
   jx preflight doctor                                       git, base ref, repo config, pack scripts, test python
   jx preflight vendor [--dry-run] [--allow-dirty]           copy this engine into the repo as .jx/preflight/engine/, so
@@ -34,7 +35,7 @@ repository `jx preflight` hands every command but `vendor` to that copy, so ever
 JX_PREFLIGHT_OWN=1 runs jx's own instead. A copy that no longer matches its ENGINE.json refuses to run: it is replaced
 as a whole with `vendor`, never edited.
 """
-import argparse, fnmatch, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+import argparse, fnmatch, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -250,7 +251,13 @@ class Change:
     def test_python(self):
         """The python that runs the repo's tests: $PREFLIGHT_TEST_PYTHON; else `test_python`, a command printing the
         path; else, where that command's program is not installed, `test_python_fallback`, a path in the repo; else
-        this interpreter."""
+        this interpreter. The command gets what is left of the run's budget: a cold one that builds an environment is
+        stopped there, and the checks that need it say so."""
+        with self.__dict__.setdefault("_test_python_lock", threading.Lock()):  # the checks that run tests start together: resolve once
+            return self._resolve_test_python()
+
+    def _resolve_test_python(self):
+        if isinstance(getattr(self, "_test_python", None), Skipped): raise self._test_python
         if not hasattr(self, "_test_python"):
             cmd, spare = self.config.get("test_python"), self.config.get("test_python_fallback")
             argv = shlex.split(cmd) if cmd else []
@@ -262,7 +269,13 @@ class Change:
                                   "set PREFLIGHT_TEST_PYTHON")
                 self._test_python = str(self.root / spare)
             elif cmd:
-                p = run(argv, cwd=self.root, check=False, timeout=1800)
+                left = max(0.1, self.deadline - time.time()) if getattr(self, "deadline", None) else 1800
+                try:
+                    p = run(argv, cwd=self.root, check=False, timeout=left)
+                except RuntimeError:  # it did not finish in what was left of the budget
+                    self._test_python = Skipped(f"the test python command did not finish within the run's {self.args.budget} s budget: "
+                                                f"`{cmd}`. Run it once yourself, which builds the interpreter, then run this again")
+                    raise self._test_python
                 path = (p.stdout.strip().splitlines() or [""])[-1]
                 if p.returncode or not path: raise RuntimeError(f"test_python command failed: {cmd}: {p.stderr.strip()[:300]}")
                 self._test_python = path
@@ -383,10 +396,15 @@ def run_pack(ctx, spec, change_json):
     return rows, err
 
 
-def selected(checks, a):
+def picker(a):
+    """Whether --only and --skip leave a check id in the run; jx's checks and the repository's pack go by the same rule."""
     only = {x for s in (a.only or []) for x in s.split(",") if x}
     skip = {x for s in (a.skip or []) for x in s.split(",") if x}
-    pick = lambda cid: (not only or any(fnmatch.fnmatch(cid, o) for o in only)) and not any(fnmatch.fnmatch(cid, s) for s in skip)
+    return lambda cid: (not only or any(fnmatch.fnmatch(cid, o) for o in only)) and not any(fnmatch.fnmatch(cid, s) for s in skip)
+
+
+def selected(checks, a):
+    pick = picker(a)
     return [c for c in checks if pick(c.id) and (c.tier == "fast" or a.full)]
 
 
@@ -410,7 +428,7 @@ def cmd_run(a):
     t0 = time.time()
     ctx = Change(root, a, config)
     ctx.deadline = t0 + a.budget  # the whole run ends by then: every test run and pack script is cut to what is left
-    packs = [s for s in pack_checks(ctx) if not a.only or any(fnmatch.fnmatch(s.get("id", ""), o) for x in a.only for o in x.split(","))]
+    packs = [s for s in pack_checks(ctx) if picker(a)(s.get("id", ""))]
     if a.dry_run:
         rows = [dict(check=c.id, tier=c.tier, kind="jx", reason=c.finds) for c in checks]
         rows += [dict(check=s.get("id", "pack"), tier=s.get("tier", "fast"), kind="pack", reason=str(s.get("cmd"))) for s in packs]
