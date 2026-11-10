@@ -307,6 +307,19 @@ print(json.dumps(value))
         self.assertGreater((out / 'output.log').stat().st_size, 20000)
         self.assertEqual(self.cli('check', 'show', out).returncode, 7)
 
+    def test_check_receipts_are_indexed_by_commit(self):
+        outs = [(self.base / name).resolve() for name in ('first', 'second')]  # check.py records the resolved DIR
+        for out in outs:
+            self.assertEqual(self.cli('check', 'run', '--out', out, '--', sys.executable, '-c', 'pass').returncode, 0)
+        entries = sorted((self.repo / '.git' / 'jx-check' / self.head).iterdir())
+        self.assertEqual(len(entries), 2)
+        indexed = {json.loads(e.read_text())['out']: json.loads(e.read_text()) for e in entries}
+        for out in outs:
+            receipt = json.loads((out / 'result.json').read_text())
+            self.assertIn(Path(receipt['index']).resolve(), [e.resolve() for e in entries])
+            self.assertEqual({**indexed[str(out)], 'index': receipt['index']}, {**receipt, 'out': str(out)})
+        self.assertIn('index: ', (outs[0] / 'summary.txt').read_text())
+
     def test_junit_counts_actual_cases_and_rejects_missing_report(self):
         out = self.base / 'junit'
         xml = '<testsuites tests="999"><testsuite><testcase/><testcase><skipped/></testcase><testcase><failure/></testcase></testsuite></testsuites>'
