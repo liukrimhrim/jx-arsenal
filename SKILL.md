@@ -19,6 +19,7 @@ jx review 1234 --out /tmp/pr1234              # source/diff + full feedback, inc
 jx review 1234 --check-only --previous /tmp/pr1234/snapshot.json --out /tmp/pr1234-next
 jx check run --junit junit.xml -- python -m pytest tests --junitxml '{out}/junit.xml'
 jx preflight run --full --body draft.md       # before opening a PR: findings TSV; fix blocks, dispose asks in the ledger it writes
+jx preflight vendor                           # pin a copy of the engine in the repo, so the same run works there without jx
                                               # (--full test runs are sandboxed on macOS so mutants cannot signal your processes)
 jx pr triage 1234 --wait                       # wait for checks, then failed-job log lines for every failing run
 jx pr ci 1234 --failed | jx ci failed -        # same thing as two composable steps; `-` reads run_id from stdin

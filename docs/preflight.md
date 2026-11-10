@@ -90,6 +90,7 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
 | `governing_docs` | spec documents `spec.ledger` turns into requirement asks |
 | `test_commands` | documented test commands `tests.collect` must be able to collect; `{python}` is replaced by the test python |
 | `test_python`, `test_env` | the command that prints the test interpreter, and extra environment for test runs |
+| `test_python_fallback` | a path in the repo used as the test interpreter where `test_python`'s program is not installed; `$PREFLIGHT_TEST_PYTHON` overrides both |
 | `ci_only_dirs` | test directories only CI can run (they are still searched for callers) |
 | `status_vocab` | string literals mutation swaps (default `pass`, `fail`, `pending`) |
 | `secret_allow` | globs where long digests are expected (locks, manifests) |
@@ -110,6 +111,27 @@ Pack scripts run side by side, and beside jx's own checks, so a run takes about 
 It prints findings as `check⇥severity⇥path⇥line⇥message⇥origin` and exits 0. A non-zero exit becomes a
 `block` naming the script. Repository knowledge lives in the pack: which locks to recheck, which readers to
 fuzz, which local citation rule applies. Generic checks live here.
+
+## A copy in the repository
+
+A repository whose contributors may not have jx can hold the engine itself:
+
+```
+jx preflight vendor            # writes .jx/preflight/engine/: preflight.py, the two check modules, ENGINE.json
+python3 .jx/preflight/engine/preflight.py run --full --body draft.md     # the same run, with python and git alone
+```
+
+- **Pinned.** `ENGINE.json` names the jx commit and each file's sha256. `vendor` refuses an engine with
+  uncommitted changes (`--allow-dirty` to try a copy first; the commit is then marked `+dirty`), and
+  `--dry-run` says which files would change.
+- **One version for everyone.** Inside a repository with a copy, `jx preflight` hands every command but
+  `vendor` to that copy. `JX_PREFLIGHT_OWN=1` runs jx's own engine there, to try a new check before vendoring it.
+- **Never edited.** A copy whose files no longer match `ENGINE.json` refuses to run and names the two ways out:
+  restore it, or take a new copy.
+- **Its own name in hints.** A wrapper script sets `PREFLIGHT_PROG` to the command people type in that repository,
+  and the hints name it in place of `jx preflight`.
+- **Without jx's other tools.** Set `test_python_fallback` for machines where the `test_python` command cannot run.
+  Add the copy's folder to `excludes`, or the run checks and mutates the engine as if it were the repository's code.
 
 ## Limits
 

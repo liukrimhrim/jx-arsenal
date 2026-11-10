@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from preflight import Check, Skipped, run
+from preflight import PROG, Check, Skipped, run
 
 
 def _env(ctx):
@@ -50,7 +50,7 @@ def sandbox_problem():
         p = subprocess.run(["sandbox-exec", "-p", SANDBOX, "/usr/bin/true"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"sandbox-exec did not run ({e}); the --full test runs need macOS"
-    return f"sandbox-exec exited {p.returncode}: {p.stderr.strip()[:200]} (inside another sandbox? run jx preflight outside it)" if p.returncode else ""
+    return f"sandbox-exec exited {p.returncode}: {p.stderr.strip()[:200]} (inside another sandbox? run {PROG} outside it)" if p.returncode else ""
 
 
 def pytest(ctx, tree, files, timeout=None, extra=(), env=None, times=None):

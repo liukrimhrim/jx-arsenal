@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -389,6 +390,66 @@ class HygieneAndRunnerTests(Base):
         self.assertNotIn("tests.mutate", p.stdout)
         p = subprocess.run([sys.executable, str(JX), "preflight", "ls"], cwd=r.path, text=True, capture_output=True)
         self.assertIn("tests.mutate\tfull", p.stdout)
+
+
+class VendorTests(Base):
+    """A repository's own copy of the engine: made by `vendor`, run without jx, and what jx runs there."""
+
+    def jx(self, r, *args, env=None):
+        return subprocess.run([sys.executable, str(JX), "preflight", *map(str, args)], cwd=r.path, text=True, capture_output=True,
+                              env={**os.environ, **(env or {})})
+
+    def test_vendor_writes_a_pinned_copy_that_runs_without_jx(self):
+        import hashlib
+        r = self.repo({"a.py": "x = 1\n"})
+        engine = r.path / ".jx/preflight/engine"
+        dry = self.jx(r, "vendor", "--dry-run", "--allow-dirty")
+        self.assertEqual((dry.returncode, engine.exists()), (0, False), dry.stderr)
+        self.assertEqual(dry.stdout.count("\tnew"), 4)
+        made = self.jx(r, "vendor", "--allow-dirty")  # this checkout's engine may have uncommitted edits while it is worked on
+        self.assertEqual(made.returncode, 0, made.stderr)
+        manifest = json.loads((engine / "ENGINE.json").read_text())
+        self.assertEqual(sorted(manifest["files"]), ["_preflight_dynamic.py", "_preflight_static.py", "preflight.py"])
+        for name, digest in manifest["files"].items():
+            self.assertEqual(hashlib.sha256((engine / name).read_bytes()).hexdigest(), digest)
+            self.assertEqual((engine / name).read_bytes(), (ROOT / "tools" / name).read_bytes())
+        self.assertRegex(manifest["commit"], r"^[0-9a-f]{40}(\+dirty)?$")
+        self.assertEqual(self.jx(r, "vendor", "--allow-dirty").stdout.count("\tsame"), 4)
+        alone = subprocess.run([sys.executable, str(engine / "preflight.py"), "ls"], cwd=r.path, text=True, capture_output=True,
+                               env={"PATH": os.path.dirname(shutil.which("git")), "PREFLIGHT_PROG": "python3 run.py"})
+        self.assertEqual(alone.returncode, 0, alone.stderr)
+        self.assertIn("refs.removed\t", alone.stdout)
+        again = subprocess.run([sys.executable, str(engine / "preflight.py"), "vendor"], cwd=r.path, text=True, capture_output=True)
+        self.assertIn("this is a repository's copy", again.stderr)  # a copy is not a source of copies
+        with open(engine / "_preflight_static.py", "a") as f: f.write("# a fix made in place\n")
+        edited = subprocess.run([sys.executable, str(engine / "preflight.py"), "ls"], cwd=r.path, text=True, capture_output=True)
+        self.assertEqual(edited.returncode, 1)
+        self.assertIn("_preflight_static.py in", edited.stderr)
+        self.assertIn("no longer match ENGINE.json", edited.stderr)
+
+    def test_in_a_repository_with_a_copy_jx_runs_the_copy(self):
+        r = self.repo({"a.py": "x = 1\n", ".jx/preflight/engine/preflight.py": "import sys\nprint('the copy ran', *sys.argv[1:])\n"})
+        self.assertEqual(self.jx(r, "ls", "--json").stdout, "the copy ran ls --json\n")
+        own = self.jx(r, "ls", env={"JX_PREFLIGHT_OWN": "1"})
+        self.assertIn("refs.removed\t", own.stdout)
+        self.assertEqual(self.jx(r, "vendor", "--dry-run", "--allow-dirty").stdout.count("\tupdate"), 1)  # vendor stays jx's own
+
+    def test_a_machine_without_the_test_python_command_uses_the_fallback(self):
+        r = self.repo({"a.py": "x = 1\n", "venv/bin/python": "#!/bin/sh\n"})
+        code = ("import argparse, sys\nsys.path.insert(0, sys.argv[1])\nimport preflight as p\n"
+                "config = {**p.DEFAULTS, 'test_python': 'no-such-program-xyz path', 'test_python_fallback': sys.argv[2]}\n"
+                "try: print(p.Change(sys.argv[3], argparse.Namespace(base='main', body=None, pr=None), config).test_python())\n"
+                "except p.Skipped as e: print('skipped:', e)\n")
+        def resolved(spare, **env):
+            return subprocess.run([sys.executable, "-c", code, str(ROOT / "tools"), spare, str(r.path)], cwd=r.path, text=True, capture_output=True,
+                                  env={**os.environ, **env}).stdout.strip()
+        self.assertEqual(resolved("venv/bin/python"), str(r.path / "venv/bin/python"))
+        self.assertEqual(resolved("venv/bin/python", PREFLIGHT_TEST_PYTHON="/opt/py"), "/opt/py")
+        self.assertEqual(resolved("missing/python"), "skipped: no test python: `no-such-program-xyz` is not on PATH and missing/python "
+                         "does not exist; build it, or set PREFLIGHT_TEST_PYTHON")
+        r.write({".jx/preflight.json": json.dumps({"test_python": "no-such-program-xyz path", "test_python_fallback": "venv/bin/python"})})
+        row = next(x for x in json.loads(self.jx(r, "doctor", "--base", "main", "--json").stdout) if x["item"] == "test_python")
+        self.assertEqual((row["state"], row["detail"]), ("ok", "venv/bin/python (`no-such-program-xyz` is not on PATH)"))
 
 
 def pytest_python():
