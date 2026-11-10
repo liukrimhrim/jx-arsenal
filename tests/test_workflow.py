@@ -329,6 +329,9 @@ print(json.dumps(value))
         self.assertEqual(result.returncode, 1, result.stderr)
         receipt = json.loads((out / 'result.json').read_text())
         self.assertEqual(receipt['tests'], dict(total=3, passed=1, skipped=1, failures=1, errors=0))
+        default = self.cli('check', 'run', '--junit', 'junit.xml', '--', sys.executable, '-c', command, '{out}/junit.xml',
+                           xml.replace('<failure/>', ''))  # no --out: a fresh temporary directory, resolved
+        self.assertEqual(default.returncode, 0, default.stderr)
         missing = self.cli('check', 'run', '--out', self.base / 'missing', '--junit', 'junit.xml', '--',
                            sys.executable, '-c', 'pass')
         self.assertEqual(missing.returncode, 2, missing.stderr)

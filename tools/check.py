@@ -80,7 +80,7 @@ def main():
     argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
     if not argv:
         parser.error('provide a command after --')
-    out = args.out.resolve() if args.out else Path(tempfile.mkdtemp(prefix='jx-check-'))
+    out = (args.out or Path(tempfile.mkdtemp(prefix='jx-check-'))).resolve()  # macOS TMPDIR is under the /var symlink
     if args.out:
         out.mkdir(parents=True, exist_ok=False)
     junit = (out / args.junit).resolve() if args.junit else None
