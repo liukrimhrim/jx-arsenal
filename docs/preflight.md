@@ -66,7 +66,13 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
     line of the file being mutated. Each mutant then runs only the tests that execute its line, plus any test seen
     starting a process with an environment of its own. A line no test was seen running gets every test. A test
     that reaches a line only through `python -I`, or through a child whose environment drops `PYTHONPATH`, is
-    invisible to the trace, so a kill it would make is missed. Workers default to half the CPUs, 2 to 4 (each is a worktree).
+    invisible to the trace, so a kill it would make is missed. Workers default to the CPUs less two, 2 to 8 (each
+    is a worktree, made in parallel). The baseline is split across all of them, and a mutant's tests run fastest
+    first, so `-x` reaches a kill soonest. An integer constant is mutated only where it is a comparison's boundary.
+  - **Budget.** The whole run ends within `--budget` seconds (default 60). The full-tier checks and the pack scripts
+    start together. One still running when the budget ends is stopped and says what it left undone; a pack script
+    reads `deadline` (epoch seconds) from `change.json` to stop in time. Mutation keeps its verdicts and its
+    baseline, so the next run goes on from where this one stopped.
   - **Reused verdicts.** Each full run records every mutant's verdict in the receipt (killed, survived, or unknown
     for a timeout), keyed by its line's text and the mutation. A later full run whose HEAD descends from that run's
     head reuses any verdict made with the same test files. When the test files changed, it reuses a kill while the
