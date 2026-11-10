@@ -93,7 +93,7 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
 
 ## Repo-pack contract
 
-A pack script receives `OUT/change.json` as its last argument:
+Pack scripts run side by side, and beside jx's own checks, so a run takes about as long as its slowest check. A pack script receives `OUT/change.json` as its last argument:
 
 - `repo_root`, `base`, `base_tip`, `merge_base`, `head`, `dirty`;
 - `files[]`, each with `path`, `status`, `old_path`, `excluded`, `binary`, `added`, `removed_old` and `hunks`;

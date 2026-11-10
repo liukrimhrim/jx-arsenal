@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -350,6 +351,16 @@ class HygieneAndRunnerTests(Base):
         r.commit({"a.py": "x = 2\n"})
         code, rows, _ = r.run("--only", "pack.bad")
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
+
+    def test_pack_checks_run_side_by_side(self):
+        nap = 'import time; time.sleep(3); print("{}\\twarn\\ta.py\\t1\\tslept\\tPR 1")'
+        checks = [{"id": f"pack.nap{i}", "cmd": f"python3 -c '{nap.format(f'pack.nap{i}')}'"} for i in range(3)]
+        r = self.repo({"a.py": "x = 1\n", ".jx/preflight.json": json.dumps({"checks": checks})})
+        r.commit({"a.py": "x = 2\n"})
+        t0 = time.time()
+        rows = r.run("--only", "pack.nap*")[1]
+        self.assertEqual(sorted(x["check"] for x in rows), ["pack.nap0", "pack.nap1", "pack.nap2"])
+        self.assertLess(time.time() - t0, 8)  # one after another they take 9 s
 
     def test_receipt_records_head_tier_and_open_items(self):
         r = self.repo({"a.py": "x = 1\n", ".jx/pack.py": 'print("pack.q\\task\\ta.py\\t1\\tanswer me\\tPR 1")\n',

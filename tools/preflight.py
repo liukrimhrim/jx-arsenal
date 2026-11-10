@@ -26,6 +26,7 @@ ci_only_dirs, status_vocab, secret_allow, dispositions, checks). `checks` lists 
 `<cmd> OUT/change.json`; each prints rows `check<TAB>severity<TAB>path<TAB>line<TAB>message<TAB>origin`.
 """
 import argparse, fnmatch, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -390,6 +391,14 @@ def cmd_run(a):
     (out / "change.json").write_text(json.dumps(ctx.as_json(out), indent=1))
     findings, timings, logs = [], {}, out / "logs"
     logs.mkdir(exist_ok=True)
+
+    def pack(spec):
+        s = time.time()
+        rows, err = run_pack(ctx, spec, out / "change.json")
+        return spec, rows, err, round(time.time() - s, 3)
+    # pack checks are subprocesses: run them beside jx's own, so the run takes the longest check, not the sum
+    pool = ThreadPoolExecutor(max_workers=max(1, len(packs)))
+    pending = [pool.submit(pack, spec) for spec in packs]
     for c in checks:
         s = time.time()
         try:
@@ -403,12 +412,12 @@ def cmd_run(a):
             (logs / f"{c.id}.err").write_text(traceback.format_exc())
             findings.append(Finding(c.id, "block", "", "", f"check crashed: {type(e).__name__}: {e} (see {logs / (c.id + '.err')})", "preflight"))
         timings[c.id] = round(time.time() - s, 3)
-    for spec in packs:
-        s = time.time()
-        rows, err = run_pack(ctx, spec, out / "change.json")
+    for job in pending:
+        spec, rows, err, secs = job.result()
         if err: (logs / f"{spec.get('id', 'pack')}.err").write_text(err)
         findings += rows
-        timings[spec.get("id", "pack")] = round(time.time() - s, 3)
+        timings[spec.get("id", "pack")] = secs
+    pool.shutdown()
     by_id, standing = dispositions(root, config, a.ledger)
     seen, unique = set(), []
     for f in findings:
