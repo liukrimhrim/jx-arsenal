@@ -99,7 +99,8 @@ def env_reads(tree):
             if cn in ("os.getenv", "getenv") or (isinstance(f, ast.Attribute) and f.attr in ("get", "pop", "setdefault")
                                                  and re.search(r"environ|\benv\b", ast.unparse(f.value))):
                 name = n.args[0].value
-        elif isinstance(n, ast.Subscript) and re.search(r"environ", ast.unparse(n.value)) and isinstance(n.slice, ast.Constant):
+        elif (isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Load)  # `os.environ["X"] = ...` sets X for a child: no read
+              and re.search(r"environ", ast.unparse(n.value)) and isinstance(n.slice, ast.Constant)):
             name = n.slice.value if isinstance(n.slice.value, str) else None
         if name and re.fullmatch(r"[A-Z][A-Z0-9_]{3,}", name): out.setdefault(name, n.lineno)
     return out
@@ -117,6 +118,26 @@ def cli_flags(tree):
 
 # ---------------------------------------------------------------- A. the change's reach outside the diff
 
+def binds_module(ctx, p, path):
+    """Whether file p imports the module at `path` under its own name, so that `stem.name` in p reads that module and
+    not a file called `stem.json` or another object's attribute."""
+    mod, cache = stem(path), ctx.__dict__.setdefault("_binds_module", {})
+    if (p, path) not in cache:
+        found = False
+        for n in ast.walk(ctx.tree(p) or ast.Module(body=[], type_ignores=[])):
+            if isinstance(n, ast.Import):
+                found |= any(a.name.rsplit(".", 1)[-1] == mod and a.asname in (None, mod) for a in n.names)
+            elif isinstance(n, ast.ImportFrom) and any(a.name == mod and a.asname in (None, mod) for a in n.names):
+                tail = [*filter(None, [(n.module or "").replace(".", "/")]), mod + ".py"]
+                if n.level:  # relative: from the importing file's package, `level - 1` folders up
+                    here = p.split("/")[:-1]
+                    found |= path == "/".join([*here[:len(here) - (n.level - 1)], *tail])
+                else:
+                    found |= ("/" + path).endswith("/" + "/".join(tail))
+        cache[(p, path)] = found
+    return cache[(p, path)]
+
+
 def refs_removed(ctx):
     for f in ctx.changed(".py", statuses="MDR"):
         bt = ctx.base_tree(f.path)
@@ -124,14 +145,18 @@ def refs_removed(ctx):
         ht = ctx.tree(f.path) if f.status != "D" else None
         mod = stem(f.old_path)
         defined_elsewhere = names_elsewhere(ctx, f.path)
+        # A name the module only imported is importable from it, so a use through the module still breaks. A bare
+        # mention elsewhere is that file's own import of the same thing: dropping `import json` here is not its concern.
+        passed_on = top_names(bt) - top_names(bt, imports=False)
         for name in sorted(top_names(bt) - top_names(ht) - defined_elsewhere):
             if len(name) < 4 or name.startswith("__"): continue
             rx = re.compile(rf"\b{re.escape(name)}\b")
-            for p, i, line in itertools.islice(lines_matching(ctx, rx, skip={f.path}), 8):
-                sev = "warn"
-                if p.endswith(".py") and (re.search(rf"\b{re.escape(mod)}\.{re.escape(name)}\b", line) or
-                                          re.search(rf"\bfrom\s+[\w.]*\b{re.escape(mod)}\s+import\b.*\b{re.escape(name)}\b", line)):
-                    sev = "block"
+            attr = re.compile(rf"\b{re.escape(mod)}\.{re.escape(name)}\b")
+            imported = re.compile(rf"\bfrom\s+[\w.]*\b{re.escape(mod)}\s+import\b.*\b{re.escape(name)}\b")
+            def through(p, line):  # `from mod import name`, or `mod.name` in a file that imports mod
+                return p.endswith(".py") and bool(imported.search(line) or attr.search(line) and binds_module(ctx, p, f.old_path))
+            hits = ((p, i, "block" if through(p, line) else "warn") for p, i, line in lines_matching(ctx, rx, skip={f.path}))
+            for p, i, sev in itertools.islice((h for h in hits if h[2] == "block" or name not in passed_on), 8):
                 yield p, i, f"`{name}` was removed from {f.old_path} but is still referenced here", sev
         for kind, old, new in (("env var", env_reads(bt), env_reads(ht)), ("CLI flag", cli_flags(bt), cli_flags(ht))):
             for name in sorted(set(old) - set(new)):

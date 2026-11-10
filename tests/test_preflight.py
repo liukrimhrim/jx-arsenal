@@ -77,6 +77,26 @@ class ReachTests(Base):
         code, rows, _ = r.run("--only", "refs.removed")
         self.assertEqual((code, rows), (0, []))
 
+    def test_a_dropped_import_is_only_missed_by_code_that_reached_it_through_the_module(self):
+        files = {"pkg/a.py": "import json\n", "pkg/b.py": "import json\njson.dumps(1)\n", "README.md": "It prints json.\n",
+                 "pkg/d.py": "RECORD = 'out/a.json'  # a file name, not module a's json\n"}
+        r = self.repo(files)
+        r.commit({"pkg/a.py": "X = 1\n"})
+        self.assertEqual(r.run("--only", "refs.removed")[:2], (0, []))  # `json` elsewhere is each file's own import
+        r = self.repo({**files, "pkg/b.py": "from pkg.a import json\njson.dumps(1)\n"})
+        r.commit({"pkg/a.py": "X = 1\n"})
+        code, rows, _ = r.run("--only", "refs.removed")
+        self.assertEqual((code, [(x["severity"], x["path"]) for x in rows]), (1, [("block", "pkg/b.py")]))
+        r = self.repo({**files, "pkg/b.py": "import pkg.a\npkg.a.json.dumps(1)\n"})  # reached as the module's attribute
+        r.commit({"pkg/a.py": "X = 1\n"})
+        self.assertEqual([(x["severity"], x["path"]) for x in r.run("--only", "refs.removed")[1]], [("block", "pkg/b.py")])
+
+    def test_an_env_var_the_code_only_sets_is_not_one_it_reads(self):
+        r = self.repo({"a.py": "x = 1\n"})
+        r.commit({"a.py": "import os\nos.environ['CHILD_ONLY_VAR'] = '1'\nmode = os.environ['READ_HERE_VAR']\n"})
+        code, rows, _ = r.run("--only", "env.undocumented")
+        self.assertEqual([x["message"].split("`")[1] for x in rows], ["READ_HERE_VAR"])
+
     def test_changed_signature_breaks_untouched_caller(self):
         r = self.repo({"lib.py": "def speed(plan, target):\n    return plan\n", "tests/protocol/rehearsal.py": "from lib import speed\nspeed(1, 2)\n"})
         r.commit({"lib.py": "def speed(plan, target, *, root):\n    return plan\n"})
