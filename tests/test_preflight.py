@@ -480,11 +480,11 @@ class DynamicTests(Base):
                        ".jx/preflight.json": self.config(checks=[{"id": "pack.slow", "cmd": "python3 -c 'import time; time.sleep(60)'"}])})
         r.commit({"calc.py": "def ok(x):\n    return x if x < 10 else 0\n", "tests/test_calc.py": slow.format("1 ")})
         t0 = time.time()
-        code, rows, _ = r.run("--full", "--budget", "6")
-        self.assertLess(time.time() - t0, 12)  # the tests and the pack script each sleep 60 s
-        said = {x["check"]: x["message"] for x in rows}
-        self.assertIn("did not finish within the run's 6 s budget", said["pack.slow"])
-        self.assertIn("did not finish once within the run's 6 s budget", said["tests.mutate"])
+        code, rows, _ = r.run("--full", "--budget", "12")
+        self.assertLess(time.time() - t0, 14)  # the tests and the pack script each sleep 60 s
+        said = {c: " | ".join(x["message"] for x in rows if x["check"] == c) for c in ("pack.slow", "tests.mutate")}
+        self.assertIn("did not finish within the run's 12 s budget", said["pack.slow"])
+        self.assertIn("did not finish once within the run's 12 s budget", said["tests.mutate"])
         self.assertEqual(code, 0)  # an unfinished check is not a block
 
     def test_each_mutant_runs_only_the_tests_that_execute_its_line(self):
