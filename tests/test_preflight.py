@@ -405,6 +405,28 @@ class DynamicTests(Base):
         self.assertTrue(survivors and all(x["path"] == "calc.py" for x in survivors), rows)
         self.assertTrue(any(x["severity"] == "info" and "survived" in x["message"] for x in rows))
 
+    def test_mutant_cannot_signal_outside_its_tree(self):
+        # The mutant `if not owned` → `if (owned)` makes reap() SIGKILL the pid it was told to leave alone. The only pids
+        # reap() ever receives are this test's sentinel and the test file's own child, so a broken guard kills only the sentinel.
+        sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        self.addCleanup(sentinel.wait); self.addCleanup(sentinel.kill)
+        r = self.repo({".jx/preflight.json": self.config()})
+        r.commit({"reaper.py": "import os, signal\ndef reap(pid, owned):\n    if not owned:\n        return False\n    os.kill(pid, signal.SIGKILL)\n    return True\n",
+                  "tests/test_reaper.py": "import os, subprocess, sys\nfrom reaper import reap\n"
+                                          "def test_leaves_a_foreign_process_alone():\n    assert reap(int(os.environ['SENTINEL']), owned=False) is False\n"
+                                          "def test_reaps_its_own_child():\n    p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                                          "    try:\n        assert reap(p.pid, owned=True) is True\n        assert p.wait(10) == -9\n    finally:\n        p.kill(); p.wait()\n"})
+        rows = r.run("--full", "--only", "tests.mutate", "--budget", "120", env=dict(os.environ, SENTINEL=str(sentinel.pid)))[1]
+        self.assertIsNone(sentinel.poll(), "a mutant signalled a process outside its test run")
+        self.assertTrue(any(x["severity"] == "info" and x["message"].startswith("mutation: 3 killed, 0 survived") for x in rows), rows)
+
+    def test_without_a_sandbox_the_tests_do_not_run(self):
+        r = self.repo({".jx/preflight.json": self.config()})
+        r.commit({"calc.py": "def ok(x):\n    return x > 1\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(2)\n"})
+        p = subprocess.run(["sandbox-exec", "-p", "(version 1)(allow default)", sys.executable, str(JX), "preflight", "run", "--base", "main", "--json",
+                            "--full", "--only", "tests.mutate"], cwd=r.path, text=True, capture_output=True)  # a sandbox cannot nest
+        self.assertEqual([(x["severity"], x["message"][:13]) for x in json.loads(p.stdout)], [("warn", "check skipped")], p.stderr)
+
     def test_fix_removal_and_collection(self):
         r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",
                        ".jx/preflight.json": self.config()})

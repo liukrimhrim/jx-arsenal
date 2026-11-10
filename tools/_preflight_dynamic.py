@@ -1,12 +1,12 @@
 """Dynamic checks for `jx preflight --full`: test collection, the fix-removal run and mutation of changed lines.
 They run the repo's tests with `test_python` inside temporary `git worktree`s (tests that call git need a real
 checkout), carry over uncommitted and untracked changes, and remove the worktrees afterwards."""
-import ast, copy, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
+import ast, copy, functools, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from preflight import Check, run
+from preflight import Check, Skipped, run
 
 
 def _env(ctx):
@@ -35,10 +35,29 @@ def drop(ctx, d):
     run(["git", "-C", str(ctx.root), "worktree", "prune"], check=False)
 
 
+# Mutants and reverted code run on the user's machine. One flipped `not in` in a leak scan SIGKILLed every process its
+# owner had (ocria-inference PR 121). This macOS profile denies every signal whose target is outside the sandbox, which
+# only the test run's own descendants share. Sandboxed processes cannot exec setuid binaries, so /bin/ps, which only
+# reads, runs outside it.
+SANDBOX = ('(version 1)(allow default)(deny signal)(allow signal (target same-sandbox))'
+           '(allow process-exec (literal "/bin/ps") (with no-sandbox))')
+
+
+@functools.cache
+def sandbox_problem():
+    """Why test runs cannot be confined to their own process tree here, or "" when sandbox-exec works."""
+    try:
+        p = subprocess.run(["sandbox-exec", "-p", SANDBOX, "/usr/bin/true"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"sandbox-exec did not run ({e}); the --full test runs need macOS"
+    return f"sandbox-exec exited {p.returncode}: {p.stderr.strip()[:200]} (inside another sandbox? run jx preflight outside it)" if p.returncode else ""
+
+
 def pytest(ctx, tree, files, timeout=None, extra=()):
     """Run pytest on files inside tree. Returns (status, {case: pass|fail|skip}, seconds); status is ok, failed or timeout."""
+    if sandbox_problem(): raise Skipped(f"tests must not run where they can signal processes outside their own tree: {sandbox_problem()}")
     fd, junit = tempfile.mkstemp(suffix=".xml", prefix="jx-preflight-"); os.close(fd)
-    argv = [ctx.test_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", *extra, *files]
+    argv = ["sandbox-exec", "-p", SANDBOX, ctx.test_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", *extra, *files]
     t0 = time.time()
     p = subprocess.Popen(argv, cwd=tree, env=_env(ctx), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:

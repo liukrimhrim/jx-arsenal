@@ -13,7 +13,8 @@ Severity: block = definite defect; warn = likely defect, look at it; ask = needs
 Scope: the diff is merge-base(--base, HEAD) against the working tree, plus untracked files. Searches run over the "live
 set": tracked and untracked files minus `frozen_lists` (sha256 manifests whose files never change) and `excludes`.
 The fast tier is static. --full adds test collection, a fix-removal run (changed tests against base code) and mutation
-of changed lines (--budget seconds), each in temporary `git worktree`s that are removed afterwards.
+of changed lines (--budget seconds), each in temporary `git worktree`s that are removed afterwards, under a macOS
+sandbox that denies signals to any process outside the test run's own tree (elsewhere those checks are skipped).
 Receipts: every run writes <git-common-dir>/preflight/<HEAD>.<fast|full>.json (head, dirty, partial, the open blocks
 and asks with their ids), so a hook or a reviewer can ask whether this exact commit passed without rerunning it.
 Dispositions: a ledger line `- <id> <reason>` (the run writes a template to OUT/ledger.md; pass it back with --ledger),
@@ -27,6 +28,7 @@ from pathlib import Path
 
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+if __name__ == "__main__": sys.modules["preflight"] = sys.modules[__name__]  # else the checks' `from preflight import` makes a second copy whose Missing/Skipped escape main's except clauses
 SEVERITIES = ("block", "warn", "ask", "info")
 HEADER = ["id", "check", "severity", "path", "line", "message", "origin", "disposition"]
 DEFAULTS = {"frozen_lists": [], "excludes": [".claude/worktrees/**", "node_modules/**", ".venv*/**"], "governing_docs": [],
@@ -36,6 +38,10 @@ DEFAULTS = {"frozen_lists": [], "excludes": [".claude/worktrees/**", "node_modul
 
 class Missing(Exception):
     """A required executable is not on PATH."""
+
+
+class Skipped(Exception):
+    """A check cannot run safely here; it reports why as a warning."""
 
 
 def run(argv, cwd=None, ok=(0,), timeout=None, env=None, check=True):
@@ -388,6 +394,8 @@ def cmd_run(a):
             findings += c(ctx)
         except Missing as e:
             findings.append(Finding(c.id, "warn", "", "", f"{e}: not found on PATH; check skipped", "preflight"))
+        except Skipped as e:
+            findings.append(Finding(c.id, "warn", "", "", f"check skipped: {e}", "preflight"))
         except Exception as e:  # a crashing check must not hide the others; it reports itself as a block
             import traceback
             (logs / f"{c.id}.err").write_text(traceback.format_exc())
@@ -479,6 +487,9 @@ def cmd_doctor(a):
     exe = shlex.split(tp)[0] if tp else sys.executable
     found = shutil.which(exe) or (Path(exe).is_file() and exe)
     rows.append(dict(item="test_python", state="ok" if found else "missing", detail=tp or f"{sys.executable} (default)"))
+    import _preflight_dynamic
+    why = _preflight_dynamic.sandbox_problem()
+    rows.append(dict(item="sandbox", state="missing" if why else "ok", detail=why or "--full test runs cannot signal outside their own tree"))
     if a.json: print(json.dumps(rows, indent=1))
     else:
         print("item\tstate\tdetail")
@@ -510,7 +521,7 @@ def main():
     r.add_argument("--config", help="config file to use instead of the repo's .jx/preflight.json (e.g. today's config on an old commit)")
     r.add_argument("--dry-run", action="store_true", help="list the checks that would run, run none")
     sub.add_parser("ls", parents=[common], help="the check catalogue")
-    d = sub.add_parser("doctor", parents=[common], help="git, base ref, config, pack scripts, test python")
+    d = sub.add_parser("doctor", parents=[common], help="git, base ref, config, pack scripts, test python, sandbox")
     d.add_argument("--base", default="origin/main", help="base ref to resolve (default origin/main)")
     d.add_argument("--config", help="config file to check instead of the repo's .jx/preflight.json")
     a = parser.parse_args()

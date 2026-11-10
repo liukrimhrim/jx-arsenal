@@ -52,6 +52,12 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
 - **`--full`** runs the repo's tests with `test_python`, a command that prints a python path, for example
   `jx venv path -p 3.12 -r tests/requirements.txt`. Each run happens in temporary `git worktree`s that carry
   uncommitted and untracked changes and are removed afterwards.
+  - **Sandbox.** Mutants and reverted code run on your machine, so each test run starts under `sandbox-exec`
+    with a profile that denies every signal to a process outside the run's own tree. A mutant of a leak
+    scan's filter once SIGKILLed every process its owner had. The run can still kill its own children, and
+    `/bin/ps` (setuid, read-only) runs outside the sandbox so process scans still work. Where `sandbox-exec`
+    cannot start (Linux, or already inside a sandbox), fix-removal and mutation are skipped with a warning;
+    `jx preflight doctor` shows which.
   - **Mutation** splices one node's exact byte range per mutant, so file-hash tests stay meaningful. It first
     runs a no-op control mutant: tests that fail on the control (hash-pinned files) don't count as kills.
     Timeouts count as unknown. `--budget` bounds the run.
@@ -93,5 +99,7 @@ fuzz, which local citation rule applies. Generic checks live here.
   local test can reach (a provider quota, a host memory limit) still needs a real run.
 - Workflow parsing covers the YAML GitHub workflows use (block mappings and sequences, block scalars, flow
   lists) and `matrix`, `if:`, `env` substitution. It does not follow reusable workflows or composite actions.
+- The sandbox only stops signals. A test can still ask launchd (`launchctl kill`) or an app (`osascript`) to stop
+  something, or delete files outside its worktree.
 - Name resolution for `refs.callers` follows `from X import f`, `import X as m` and same-module calls. It does
   not follow calls through instances.
