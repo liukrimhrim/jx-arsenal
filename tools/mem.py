@@ -135,7 +135,7 @@ def cmd_edit(a):
         if n != 1: sys.exit(f"--replace OLD matches {n} times in {file}; it must match exactly once")
         text = text.replace(old, new); changed.append("body")
     if a.desc is not None:
-        text, n = re.subn(r"^description: .*$", f"description: {a.desc}", text, count=1, flags=re.M)
+        text, n = re.subn(r"^description: .*$", lambda m: f"description: {a.desc}", text, count=1, flags=re.M)  # a lambda: `\d` in the text is not a group reference
         if not n: sys.exit(f"{file} has no `description:` frontmatter line")
         changed.append("description"); ip = os.path.join(d, "MEMORY.md"); idx = open(ip).read()
         idx, n = re.subn(r"(\]\(" + re.escape(file) + r"\)\s*—\s*)[^·\n]*", lambda m: m.group(1) + a.desc[:80], idx, count=1)

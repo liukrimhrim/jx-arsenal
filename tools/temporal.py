@@ -20,9 +20,12 @@ JSON output, prints TSV. --json for the raw payload.
 Defaults: k8s namespace `temporal`, the first Service whose name ends in `frontend-headless`, Temporal namespace `default`.
 Filters compose into a visibility query: WorkflowType, ExecutionStatus, TaskQueue, StartTime >= now-since, AND --query verbatim.
 """
-import argparse, contextlib, io, json, os, re, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, json, os, re, shutil, signal, socket, subprocess, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _fanout import fan_out
 from datetime import datetime, timedelta, timezone
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # a harness timeout must still unwind forward(), or its port-forward is orphaned
 CFG = os.path.expanduser("~/.config/jx-arsenal/temporal.json")
 
 def env_of(name):
@@ -281,15 +284,6 @@ def main():
     for b in ("kubectl", "temporal"):
         if not shutil.which(b): sys.exit(f"`{b}` not found on PATH; install it, then `jx temporal <env> doctor`")
     if a.env != "all": a.f(a); return
-    first = True
-    for env in all_envs():
-        a.env = env; buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try: a.f(a)
-            except SystemExit as e: sys.stderr.write(f"[{env}] {e}\n"); continue
-        lines = buf.getvalue().splitlines()
-        if a.json or a.cmd == "doctor": print(buf.getvalue(), end=""); continue
-        if first and lines: print("env\t" + lines[0]); first = False
-        for ln in lines[1:]: print(f"{env}\t{ln}")
+    fan_out(all_envs(), a, raw=a.cmd == "doctor")
 
 if __name__ == "__main__": main()

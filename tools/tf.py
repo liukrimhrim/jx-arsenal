@@ -107,13 +107,13 @@ def cmd_plan(a):
     if d := dirty(root): warn(f"{root} has {len(d)} uncommitted changes; this plan reflects the working tree, not a commit")
     if (b := branch(root)) and b not in ("main", "master"): warn(f"on branch {b}; a plan here is not what CI plans from main")
     if init(root, a.upgrade): warn("backend reconfigured (backend block differed from the cached init)")
-    out = a.out or os.path.join(tempfile.mkdtemp(prefix="jx-tf-"), "plan.tfplan")
+    out = os.path.abspath(a.out) if a.out else os.path.join(tempfile.mkdtemp(prefix="jx-tf-"), "plan.tfplan")  # terraform runs with -chdir: relative paths would land in the root
     args = ["plan", "-input=false", "-no-color", "-detailed-exitcode", f"-out={out}", "-lock=true" if a.lock else "-lock=false"]
     if a.lock: args.append("-lock-timeout=2m")
     if a.refresh_only: args.append("-refresh-only")
     for t in a.target: args += ["-target", t]
     for v in a.var: args += ["-var", v]
-    if a.var_file: args += ["-var-file", a.var_file]
+    if a.var_file: args += ["-var-file", os.path.abspath(a.var_file)]
     rc, pout, perr = run(root, *args)
     if rc == 1: fail(root, "plan", perr + pout)
     plan = show_json(root, out)
@@ -142,7 +142,7 @@ def changed_files(cwd, base):
         if mb: sys.stderr.write("--changed: origin/main shares no history with HEAD here; using local main\n")
     if not mb: sys.exit(f"no merge-base between `{base}` and HEAD (unknown ref, or a shallow clone cut the history); `git fetch --unshallow`, or pass --changed <ref> that shares history")
     files = set(git(cwd, "diff", "--name-only", mb).splitlines())
-    files |= {l[3:].split(" -> ")[-1] for l in git(cwd, "status", "--porcelain").splitlines() if l.strip()}
+    files |= {l.split(None, 1)[-1].split(" -> ")[-1] for l in git(cwd, "status", "--porcelain", "-uall").splitlines() if l.strip()}  # -uall: a new root under an untracked parent is listed, not collapsed to the parent
     return top, {os.path.normpath(f) for f in files}
 
 def cmd_roots(a):
@@ -208,14 +208,16 @@ def flatten(v, path="", out=None):
     else: out[path] = v
     return out
 
-def marked(tree, path):
-    """True when `path` or any ancestor is flagged true in an after_unknown / *_sensitive tree."""
-    for p, v in flatten(tree or {}).items():
-        if v is True and (path == p or path.startswith(p + ".")): return True
-    return False
+def flagged(tree):
+    """Paths flagged true in an after_unknown / *_sensitive tree."""
+    return {p for p, v in flatten(tree or {}).items() if v is True}
+
+def marked(flags, path):
+    """True when `path` or any ancestor is in `flags`."""
+    return path in flags or any(path[:i] in flags for i, ch in enumerate(path) if ch == ".")
 
 def cmd_diff(a):
-    root = a.root or (os.path.dirname(a.planfile) if os.path.isdir(os.path.join(os.path.dirname(a.planfile) or ".", ".terraform")) else None)
+    root = a.root or ((os.path.dirname(a.planfile) or ".") if os.path.isdir(os.path.join(os.path.dirname(a.planfile) or ".", ".terraform")) else None)
     if not root: sys.exit("pass --root <dir>: `show -json` needs the plan's root (the plan file is not next to a .terraform dir)")
     plan = show_json(root.rstrip("/"), os.path.abspath(a.planfile))
     changes = [r for r in plan.get("resource_changes", []) if r["change"]["actions"] != ["no-op"]]
@@ -227,14 +229,14 @@ def cmd_diff(a):
     rows = []
     for r in changes:
         c = r["change"]; before, after = flatten(c.get("before")), flatten(c.get("after"))
-        unknown = {p for p, v in flatten(c.get("after_unknown") or {}).items() if v is True}
+        unknown, sens_b, sens_a = flagged(c.get("after_unknown")), flagged(c.get("before_sensitive")), flagged(c.get("after_sensitive"))
         for p in sorted(set(before) | set(after) | unknown):
             b, af = before.get(p), after.get(p)
-            is_unknown = marked(c.get("after_unknown"), p)
+            is_unknown = marked(unknown, p)
             if b == af and not is_unknown: continue
             rows.append({"address": r["address"], "path": p,
-                         "before": "(sensitive)" if b is not None and marked(c.get("before_sensitive"), p) else show(b),
-                         "after": "(known after apply)" if is_unknown else "(sensitive)" if af is not None and marked(c.get("after_sensitive"), p) else show(af)})
+                         "before": "(sensitive)" if b is not None and marked(sens_b, p) else show(b),
+                         "after": "(known after apply)" if is_unknown else "(sensitive)" if af is not None and marked(sens_a, p) else show(af)})
     emit(rows, ["address", "path", "before", "after"], a, plan if a.json else None)
 
 def cmd_state(a):

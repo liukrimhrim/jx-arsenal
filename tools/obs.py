@@ -19,7 +19,9 @@
 Nothing environment-specific lives in this script. AMP calls are SigV4-signed with credentials from
 `aws configure export-credentials --profile <profile>`; no boto3. Loki is plain HTTP (reachable over the tailnet).
 """
-import argparse, contextlib, datetime as dt, hashlib, hmac, io, json, os, re, signal, subprocess, sys, urllib.error, urllib.parse, urllib.request
+import argparse, datetime as dt, hashlib, hmac, json, os, re, signal, subprocess, sys, urllib.error, urllib.parse, urllib.request
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _fanout import fan_out
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 CFG = os.path.expanduser("~/.config/jx-arsenal/obs.json")
 
@@ -71,11 +73,13 @@ def amp(env, path, params, method="POST"):
         hint = {403: f"wrong profile/region/workspace in {CFG}, or expired SSO (`jx aws -p {env['profile']} whoami`)",
                 400: "bad PromQL or selector; `jx obs <env> metrics <prefix>` lists real metric names, `jx obs <env> labels '<selector>'` real label names"}.get(e.code, "")
         sys.exit(f"AMP {e.code}: {msg}" + (f"\n→ {hint}" if hint else ""))
+    except OSError as e: sys.exit(f"AMP unreachable: {e}\n→ check the network/VPN, then `jx obs <env> doctor`; `jx aws -p {env['profile']} whoami` checks the credentials")  # DNS, no network, timeout
     if d.get("status") != "success": sys.exit(f"AMP: {d.get('errorType')}: {d.get('error')}")
     return d["data"]
 
 def loki(env, path, params):
     """GET a Loki API call on the env's Loki; returns the `data` field."""
+    if not env.get("loki"): sys.exit(f"no loki url for this env in {CFG}")
     url = f"{env['loki']}/loki/api/v1/{path}" + (f"?{urllib.parse.urlencode(params, doseq=True)}" if params else "")
     try:
         with urllib.request.urlopen(url, timeout=30) as r: d = json.load(r)
@@ -118,8 +122,9 @@ def cmd_q(a):
         emit(rows[:a.limit], ["metric", "labels", "points", "first", "last", "min", "max", "last_value"], a, d)
     else:
         d = amp(env, "query", {"query": a.query})
-        if d["resultType"] == "scalar": print(f"value\n{d['result'][1]}"); return
-        rows = [{"metric": r["metric"].get("__name__", ""), "labels": labels_str(r["metric"]), "time": iso(r["value"][0]), "value": r["value"][1]} for r in d["result"]]
+        if d["resultType"] in ("scalar", "string"): emit([{"value": d["result"][1]}], ["value"], a, d); return
+        last = lambda r: r["value"] if "value" in r else r["values"][-1]  # `up[5m]` answers with a matrix: show each series' newest sample
+        rows = [{"metric": r["metric"].get("__name__", ""), "labels": labels_str(r["metric"]), "time": iso(last(r)[0]), "value": last(r)[1]} for r in d["result"]]
         emit(rows[:a.limit], ["metric", "labels", "time", "value"], a, d)
     sys.stderr.write(f"{len(d['result'])} series\n")
 
@@ -243,15 +248,6 @@ def main():
     sp.add_parser("doctor", parents=[g], help="config resolved, AMP reachable and signed, Loki reachable").set_defaults(f=cmd_doctor)
     a = ap.parse_args()
     if a.env != "all": a.f(a); return
-    first = True
-    for env in cfg():
-        a.env = env; buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try: a.f(a)
-            except SystemExit as e: sys.stderr.write(f"[{env}] {e}\n"); continue
-        if a.json or a.cmd == "doctor": print(buf.getvalue(), end=""); continue
-        lines = buf.getvalue().splitlines()
-        if first and lines: print("env\t" + lines[0]); first = False
-        for ln in lines[1:]: print(f"{env}\t{ln}")
+    fan_out(cfg(), a, raw=a.cmd == "doctor")
 
 if __name__ == "__main__": main()

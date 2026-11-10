@@ -69,7 +69,8 @@ def build_cmds(args, d):
 def cmd_path(args):
     key = key_of(args); d = cache() / key; py = d / "bin" / "python"
     if (d / META).exists():
-        os.utime(d / META); return done(args, key, d, py, True)
+        if not args.dry_run: os.utime(d / META)  # a dry run must not reset "last used"
+        return done(args, key, d, py, True)
     py, cmds = build_cmds(args, d)
     if args.dry_run:
         print(f"DRY RUN: key {key} not cached; would build {d}"); [print("  " + " ".join(c)) for c in cmds]; return
@@ -95,14 +96,16 @@ def done(args, key, d, py, cached, secs=None):
     if args.json: print(json.dumps({"python": str(py), "dir": str(d), "key": key, "cached": cached, "build_secs": secs})); return
     print(py); sys.stderr.write(f"cached {key}\n" if cached else f"built {key} in {secs}s\n")
 
-def entries():
+def size_mb(d): return round(sum(f.lstat().st_size for f in Path(d).rglob("*") if not f.is_symlink() and f.is_file()) / 2**20)
+
+def entries(sizes=True):
+    """Cached venvs, most recently used first. sizes=False skips the walk over every file of every venv."""
     out = []
     for m in sorted(cache().glob(f"*/{META}")):
         try: meta = json.loads(m.read_text())
         except ValueError: continue
-        size = sum(f.lstat().st_size for f in m.parent.rglob("*") if not f.is_symlink() and f.is_file())
         used = datetime.fromtimestamp(m.stat().st_mtime, timezone.utc)
-        out.append({**meta, "dir": str(m.parent), "last_used": used.strftime("%Y-%m-%dT%H:%M:%SZ"), "used_dt": used, "size_mb": round(size / 2**20),
+        out.append({**meta, "dir": str(m.parent), "last_used": used.strftime("%Y-%m-%dT%H:%M:%SZ"), "used_dt": used, **({"size_mb": size_mb(m.parent)} if sizes else {}),
                     "inputs": " ".join([*("-r " + r for r in meta.get("requirements", [])), *meta.get("pkgs", [])])})
     return sorted(out, key=lambda e: e["used_dt"], reverse=True)
 
@@ -113,7 +116,7 @@ def cmd_ls(args):
     sys.stderr.write(f"{len(rows)} venvs in {cache()}\n")
 
 def cmd_rm(args):
-    es = entries()
+    es = entries(sizes=False)
     if args.unused_since:
         cut = since(args.unused_since); pick = [e for e in es if e["used_dt"] < cut]
     elif args.keys:
@@ -124,10 +127,10 @@ def cmd_rm(args):
             pick += hit
     else: sys.exit("name keys to remove, or --unused-since 14d; `jx venv ls` lists keys")
     for e in pick:
-        if args.dry_run: print(f"DRY RUN: would remove {e['dir']} ({e['size_mb']} MB, last used {e['last_used']})"); continue
+        if args.dry_run: print(f"DRY RUN: would remove {e['dir']} ({size_mb(e['dir'])} MB, last used {e['last_used']})"); continue
         with open(cache() / f"{e['key']}.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX); shutil.rmtree(e["dir"])
-        (cache() / f"{e['key']}.lock").unlink(missing_ok=True); print(f"removed {e['dir']}")
+        print(f"removed {e['dir']}")  # the lock file stays: unlinking it lets a waiter and a newcomer hold "the" lock on two inodes
     if not pick: sys.stderr.write("nothing to remove\n")
 
 def cmd_doctor(args):

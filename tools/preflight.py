@@ -61,7 +61,7 @@ class Skipped(Exception):
 
 def run(argv, cwd=None, ok=(0,), timeout=None, env=None, check=True):
     try:
-        p = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=timeout, env=env)
+        p = subprocess.run(argv, cwd=cwd, text=True, errors="replace", capture_output=True, timeout=timeout, env=env)  # a latin-1 file in the diff must not end the run
     except FileNotFoundError:
         raise Missing(argv[0])
     except subprocess.TimeoutExpired:
@@ -119,9 +119,10 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 def parse_diff(text):
     """Files of a `git diff -U0 --find-renames` patch: status, renames, added (new side) and removed (old side) lines."""
-    files, cur, old_n, new_n = [], None, 0, 0
+    files, cur, old_n, new_n, header = [], None, 0, 0, True
     for line in text.splitlines():
         if line.startswith("diff --git "):
+            header = True  # until the file's first hunk; after it `--- x` / `+++ x` are a removed `-- x` / an added `++ x`
             m = re.match(r'diff --git "?a/(.*?)"? "?b/(.*?)"?$', line)
             cur = FileChange(m.group(2), "M", m.group(1)) if m else FileChange(line.split()[-1][2:], "M")
             files.append(cur); continue
@@ -131,9 +132,10 @@ def parse_diff(text):
         elif line.startswith("rename from "): cur.status, cur.old_path = "R", line[12:]
         elif line.startswith("rename to "): cur.path = line[10:]
         elif line.startswith("Binary files") or line.startswith("GIT binary patch"): cur.binary = True
-        elif line.startswith("+++ ") and line[4:] != "/dev/null": cur.path = line[6:] if line[4:6] == "b/" else line[4:]
-        elif line.startswith("--- ") or line.startswith("+++ "): pass
+        elif header and line.startswith("+++ ") and line[4:] != "/dev/null": cur.path = line[6:] if line[4:6] == "b/" else line[4:]
+        elif header and (line.startswith("--- ") or line.startswith("+++ ")): pass
         elif (m := HUNK.match(line)):
+            header = False
             os_, ol, ns, nl = int(m[1]), int(m[2] or 1) if m[2] != "0" else 0, int(m[3]), int(m[4] or 1) if m[4] != "0" else 0
             cur.hunks.append([os_, ol, ns, nl]); old_n, new_n = os_, ns
         elif line.startswith("+"): cur.added.add(new_n); new_n += 1
@@ -178,12 +180,15 @@ class Change:
         self.live = [p for p in allp if p not in frozen and not excluded(p) and (self.root / p).is_file()]
         self.live_set = set(self.live)
         self.tracked = set(filter(None, tracked))
-        for f in self.files.values(): f.excluded = f.path not in self.live_set
+        for f in self.files.values():  # a deleted file is never live: judge it by the rules that would have excluded it
+            f.excluded = (f.path in frozen or excluded(f.path)) if f.status == "D" else f.path not in self.live_set
         self.body = self._body()
 
     def _body(self):
         a = self.args
-        if getattr(a, "body", None): return Path(a.body).read_text(errors="replace")
+        if getattr(a, "body", None):
+            try: return Path(a.body).read_text(errors="replace")
+            except OSError as e: sys.exit(f"preflight: --body: {e}")
         if getattr(a, "pr", None):
             return run(["gh", "pr", "view", str(a.pr), "--json", "body", "--jq", ".body"], cwd=self.root).stdout
         return None
@@ -361,19 +366,27 @@ def pack_checks(ctx):
     for spec in ctx.config["checks"]:
         if spec.get("tier", "fast") == "full" and not ctx.args.full: continue
         when = spec.get("when") or []
-        if when and not any(matcher(when)(p) for p in changed): continue
+        if when and not any(map(matcher(when), changed)): continue
         out.append(spec)
     return out
 
 
+def pack_cmd(spec):
+    """A pack check's argv; [] when the spec has no `cmd`."""
+    cmd = spec.get("cmd") or []
+    return cmd if isinstance(cmd, list) else shlex.split(cmd)
+
+
 def run_pack(ctx, spec, change_json):
-    cmd = spec["cmd"] if isinstance(spec["cmd"], list) else shlex.split(spec["cmd"])
-    if cmd and cmd[0] in ("python", "python3"): cmd = [sys.executable, *cmd[1:]]
+    cmd = pack_cmd(spec)
+    if not cmd: return [Finding(spec.get("id", "pack"), "block", "", "", "pack check has no `cmd`", "preflight")], ""
+    if cmd[0] in ("python", "python3"): cmd = [sys.executable, *cmd[1:]]
     try:
-        p = subprocess.Popen([*cmd, str(change_json)], cwd=ctx.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        p = subprocess.Popen([*cmd, str(change_json)], cwd=ctx.root, text=True, errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True)
-    except FileNotFoundError:
-        return [Finding(spec.get("id", "pack"), "block", "", "", f"pack check did not run: {cmd[0]} not found", "preflight")], ""
+    except OSError as e:  # not found, not executable, …
+        return [Finding(spec.get("id", "pack"), "block", "", "", f"pack check did not run: {cmd[0]} not found" if isinstance(e, FileNotFoundError)
+                        else f"pack check did not run: {cmd[0]}: {e.strerror or e}", "preflight")], ""
     late = []
     try:
         out, err = p.communicate(timeout=max(1, min(spec.get("timeout", 1800), ctx.deadline - time.time())))
@@ -428,7 +441,7 @@ def cmd_run(a):
     t0 = time.time()
     ctx = Change(root, a, config)
     ctx.deadline = t0 + a.budget  # the whole run ends by then: every test run and pack script is cut to what is left
-    packs = [s for s in pack_checks(ctx) if picker(a)(s.get("id", ""))]
+    pick = picker(a); packs = [s for s in pack_checks(ctx) if pick(s.get("id", ""))]
     if a.dry_run:
         rows = [dict(check=c.id, tier=c.tier, kind="jx", reason=c.finds) for c in checks]
         rows += [dict(check=s.get("id", "pack"), tier=s.get("tier", "fast"), kind="pack", reason=str(s.get("cmd"))) for s in packs]
@@ -549,9 +562,9 @@ def cmd_doctor(a):
         ok = (Path(root) / lst).is_file(); bad |= not ok
         rows.append(dict(item="frozen_list", state="ok" if ok else "missing", detail=lst))
     for spec in config["checks"]:
-        cmd = spec["cmd"] if isinstance(spec["cmd"], list) else shlex.split(spec["cmd"])
+        cmd = pack_cmd(spec)
         script = next((c for c in cmd if c.endswith(".py")), None)
-        ok = script is None or (Path(root) / script).is_file(); bad |= not ok
+        ok = bool(cmd) and (script is None or (Path(root) / script).is_file()); bad |= not ok
         rows.append(dict(item=f"pack {spec.get('id', '?')}", state="ok" if ok else "missing", detail=" ".join(cmd)))
     tp, spare = config.get("test_python"), config.get("test_python_fallback")
     exe = shlex.split(tp)[0] if tp else sys.executable

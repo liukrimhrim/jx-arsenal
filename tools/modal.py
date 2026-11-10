@@ -41,7 +41,9 @@ def modal(a, *args, parse=True, timeout=120):
     if a.profile: cmd += ["--profile", a.profile]
     try: p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
     except FileNotFoundError: sys.exit("`modal` not found on PATH; install the Modal CLI, then `jx modal whoami`")
-    except subprocess.TimeoutExpired as e: return (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+    except subprocess.TimeoutExpired as e:
+        if parse: sys.exit(f"modal {' '.join(args)}: no answer in {timeout}s\n→ `jx modal whoami` shows whether the CLI answers at all and under which profile")  # an empty table would read as "no apps"
+        return (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
     if p.returncode:
         err = p.stderr.strip() or p.stdout.strip()
         framed = re.findall(r"│\s*(.*?)\s*│", err)  # the CLI draws errors in a box; keep the text

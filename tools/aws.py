@@ -156,11 +156,12 @@ def cmd_logs_query(a):
         if time.time() > deadline: aws(["logs", "stop-query", "--query-id", qid], a, ok=(0, 254)); sys.exit(f"query {qid} still {r['status']} after {a.timeout}s")
         time.sleep(2)
     rows = [{f["field"].lstrip("@"): f["value"] for f in res if f["field"] != "@ptr"} for res in r.get("results", [])]
-    header = list(rows[0]) if rows else []
+    header = list(dict.fromkeys(k for row in rows for k in row))  # Insights omits absent fields per row: the first row is not the schema
     for row in rows:
         if "timestamp" in row: row["timestamp"] = utc(row["timestamp"].replace(" ", "T"))
     emit(rows, header, a, r)
     st = r.get("statistics", {}); sys.stderr.write(f"{r['status']}: {len(rows)} rows, scanned {st.get('recordsScanned', 0):.0f} records / {st.get('bytesScanned', 0)/1e6:.1f} MB\n")
+    if r["status"] != "Complete": sys.exit(1)
 
 # ---------------- eks ----------------
 def cmd_eks(a):

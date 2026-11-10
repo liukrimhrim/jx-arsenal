@@ -16,6 +16,7 @@ def _env(ctx):
 
 
 def worktree(ctx):
+    if sandbox_problem(): raise Skipped(f"tests must not run where they can signal processes outside their own tree: {sandbox_problem()}")  # before building a tree no test will run in
     d = Path(tempfile.mkdtemp(prefix="jx-preflight-wt-"))
     run(["git", "-C", str(ctx.root), "worktree", "add", "--detach", "-q", "-f", str(d), "HEAD"], timeout=900)
     dirty = run(["git", "-C", str(ctx.root), "-c", "core.quotePath=false", "diff", "--name-only", "-z", "HEAD"]).stdout.split("\0")
@@ -62,7 +63,7 @@ def pytest(ctx, tree, files, timeout=None, extra=(), env=None, times=None):
     fd, junit = tempfile.mkstemp(suffix=".xml", prefix="jx-preflight-"); os.close(fd)
     argv = ["sandbox-exec", "-p", SANDBOX, ctx.test_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", *extra, *files]
     t0 = time.time()
-    p = subprocess.Popen(argv, cwd=tree, env=env or _env(ctx), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    p = subprocess.Popen(argv, cwd=tree, env=env or _env(ctx), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
     try:
         out, _ = p.communicate(timeout=timeout)
         status = "ok" if p.returncode == 0 else "failed"
@@ -341,14 +342,15 @@ def earlier_verdicts(ctx):
     """(head, {mutant key: result}) from the latest earlier jx full run whose head is HEAD or an ancestor of it."""
     if getattr(ctx.args, "mutate_all", False): return None, {}, {}
     common = Path(run(["git", "-C", str(ctx.root), "rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.strip())
-    best = None
+    recs = []
     for p in (common / "preflight").glob("*.full.json"):
         try: rec = json.loads(p.read_text())
         except (OSError, ValueError, RecursionError): continue
         m = rec.get("mutation") if isinstance(rec, dict) else None
         if not (isinstance(m, dict) and isinstance(m.get("results"), list) and rec.get("runner") == "jx" and isinstance(rec.get("head"), str)): continue
-        if run(["git", "-C", str(ctx.root), "merge-base", "--is-ancestor", rec["head"], "HEAD"], check=False).returncode: continue
-        if best is None or str(rec.get("created", "")) > str(best.get("created", "")): best = rec
+        recs.append(rec)
+    recs.sort(key=lambda r: str(r.get("created", "")), reverse=True)  # newest first: one git call per receipt until the first ancestor, not one per receipt ever written
+    best = next((r for r in recs if not run(["git", "-C", str(ctx.root), "merge-base", "--is-ancestor", r["head"], "HEAD"], check=False).returncode), None)
     if best is None: return None, {}, {}
     base = best["mutation"].get("baselines")
     return (best["head"], {tuple(r["key"]): r for r in best["mutation"]["results"] if isinstance(r, dict) and isinstance(r.get("key"), list)},

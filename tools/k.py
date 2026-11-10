@@ -15,7 +15,9 @@
   {"envs": {"prod": {"context": "arn:aws:eks:...:cluster/x"}, "stage": {"context": "stage-cluster"}}}
 The file also defines the env list `jx k all` uses. Nothing cluster-specific lives in this script.
 """
-import argparse, base64, contextlib, io, json, os, re, shutil, subprocess, sys, signal
+import argparse, base64, json, os, re, shutil, subprocess, sys, signal
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _fanout import fan_out
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not traceback
 from datetime import datetime, timezone
 
@@ -47,12 +49,13 @@ def check_ns(env, ns):
     if ns and subprocess.run(["kubectl", "--context", context_of(env), "--request-timeout", "20s", "get", "ns", ns], capture_output=True).returncode:
         sys.exit(f"namespace {ns!r} does not exist in {env}. `jx k {env} pods -A | cut -f1 | sort -u` lists namespaces.")
 
-def kubectl(args, env, ns=None, all_ns=False, ok=(0,)):
+def kubectl(args, env, ns=None, all_ns=False, ok=(0,), timeout=None):
     # namespace flags go AFTER the verb: kubectl treats a leading -A as a plugin name
     cmd = ["kubectl", "--context", context_of(env), "--request-timeout", "20s"] + args + (["-A"] if all_ns else ["-n", ns] if ns else [])
-    try: p = subprocess.run(cmd, text=True, capture_output=True, timeout=int(os.environ.get("K_TIMEOUT", "45")))
+    timeout = int(os.environ.get("K_TIMEOUT", "45")) if timeout is None else timeout or None  # 0: no limit
+    try: p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:  # kubectl's discovery retries ignore --request-timeout; bound the whole call
-        sys.exit(f"{env}: no answer in {os.environ.get('K_TIMEOUT', '45')}s (VPN/tailnet down? wrong context?)  → run `jx k {env} doctor`")
+        sys.exit(f"{env}: no answer in {timeout}s (VPN/tailnet down? wrong context?)  → run `jx k {env} doctor`")
     if p.returncode not in ok:
         err = p.stderr.strip()
         if re.search(r"context|credential|Unauthorized|token|exec plugin|forbidden", err, re.I): hint = f"→ run `jx k {env} doctor`; a cluster behind a VPN/tailnet needs it up first"
@@ -119,7 +122,7 @@ def cmd_pods(args):
         rows.append({"ns": p["metadata"]["namespace"], "pod": p["metadata"]["name"], "ready": f"{ready}/{total}", "status": status,
                      "restarts": sum(c.get("restartCount", 0) for c in cs), "age": age(p["metadata"].get("creationTimestamp")),
                      "node": p["spec"].get("nodeName", "")})
-    healthy = lambda r: r["status"] in ("Running", "Succeeded") and r["ready"].split("/")[0] == r["ready"].split("/")[1]
+    healthy = lambda r: r["status"] == "Succeeded" or (r["status"] == "Running" and r["ready"].split("/")[0] == r["ready"].split("/")[1])  # a finished Job pod is 0/1 and fine
     rows.sort(key=lambda r: (healthy(r), r["ns"], r["pod"]))
     emit(rows, ["ns", "pod", "ready", "status", "restarts", "age", "node"], args, items)
     sys.stderr.write(f"{len(rows)} pods, {sum(not healthy(r) for r in rows)} not ready/running\n")
@@ -188,8 +191,20 @@ def cmd_logs(args):
         last = hi - 1
     sys.stderr.write(f"{len(hits)} hits in {len(lines)} lines\n")
 
+GO_UNIT = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "μs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}
+GO_PART = r"(\d+\.?\d*|\.\d+)(ns|us|µs|μs|ms|[smh])"
+
+def go_seconds(s):
+    """Seconds in a Go duration as kubectl parses --timeout (`300s`, `1m30s`, `.5h`, `1.h`, `+1m`, `90000000us`, `0`);
+    None when it is not one, or is negative: kubectl answers those at once, inside the default bound."""
+    if re.fullmatch(r"[+-]?0", s): return 0
+    if not re.fullmatch(rf"\+?({GO_PART})+", s): return None
+    return sum(float(n) * GO_UNIT[u] for n, u in re.findall(GO_PART, s))
+
 def cmd_rollout(args):
-    print(kubectl(["rollout", "status", args.target, "--timeout", args.timeout], args.env, args.n, ok=(0, 1)).strip())
+    wait = go_seconds(args.timeout)
+    if wait: wait += 30  # outlive kubectl's own --timeout, so its message is the one that surfaces; 0 stays unlimited, like kubectl's
+    print(kubectl(["rollout", "status", args.target, "--timeout", args.timeout], args.env, args.n, timeout=wait).strip())
 
 def cmd_secret(args):
     d = json.loads(kubectl(["get", "secret", args.name, "-o", "json"], args.env, args.n)).get("data", {})
@@ -228,15 +243,6 @@ def main(argv=None):
     if not shutil.which("kubectl"): sys.exit("`kubectl` not found on PATH; install it, then `jx k <env> doctor`")
     if args.env != "all": args.f(args); return
     if args.cmd in ("secret", "logs", "rollout"): sys.exit(f"`jx k all {args.cmd}` not supported; one env at a time")
-    first = True
-    for env in all_envs():
-        args.env = env; buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try: args.f(args)
-            except SystemExit as e: sys.stderr.write(f"[{env}] {e}\n"); continue
-        lines = buf.getvalue().splitlines()
-        if args.json: print(buf.getvalue()); continue
-        if first and lines: print("env\t" + lines[0]); first = False
-        for ln in lines[1:]: print(f"{env}\t{ln}")
+    fan_out(all_envs(), args)
 
 if __name__ == "__main__": main()

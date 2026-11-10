@@ -1,7 +1,7 @@
 """Static checks for `jx preflight`. Each check yields (path, line, message[, severity]); `Check` adds id and origin.
 Origins name the past review miss (PR number, review round) a check comes from; ⇢ marks an extrapolation to the same
 failure shape elsewhere."""
-import ast, difflib, fnmatch, hashlib, itertools, json, os, posixpath, re, subprocess
+import ast, difflib, fnmatch, hashlib, itertools, json, os, posixpath, re, shlex, subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -89,6 +89,13 @@ def enclosing_try_handlers(node, par):
     return names
 
 
+def _env_reads(ctx, path):
+    """env_reads of a live file, walked once per run."""
+    cache = ctx.__dict__.setdefault("_env_reads", {})
+    if path not in cache: cache[path] = env_reads(ctx.tree(path))
+    return cache[path]
+
+
 def env_reads(tree):
     """Env var names this module reads: os.environ[...], .get/.pop/.setdefault on an environ, os.getenv."""
     out = {}
@@ -160,7 +167,7 @@ def refs_removed(ctx):
                 yield p, i, f"`{name}` was removed from {f.old_path} but is still referenced here", sev
         for kind, old, new in (("env var", env_reads(bt), env_reads(ht)), ("CLI flag", cli_flags(bt), cli_flags(ht))):
             for name in sorted(set(old) - set(new)):
-                if kind == "env var" and any(name in env_reads(ctx.tree(p)) for p in ctx.live_files(".py") if p != f.path): continue
+                if kind == "env var" and any(name in _env_reads(ctx, p) for p in ctx.live_files(".py") if p != f.path): continue
                 rx = re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])")
                 for p, i, _ in itertools.islice(lines_matching(ctx, rx, skip={f.path}), 6):
                     yield p, i, f"{kind} `{name}` is no longer read/defined by {f.path} but is still named here"
@@ -630,7 +637,8 @@ def cite_drift(ctx):
     by_old = {f.old_path: f for f in changed.values()}
     side = None
     if ctx.base_tip != ctx.merge_base:
-        diff = run(["git", "-C", str(ctx.root), "diff", "-U0", "--find-renames", "--no-color", ctx.merge_base, ctx.base_tip], check=False).stdout
+        diff = run(["git", "-C", str(ctx.root), "-c", "core.quotePath=false", "diff", "-U0", "--find-renames", "--no-color", "--no-ext-diff",
+                    "--src-prefix=a/", "--dst-prefix=b/", ctx.merge_base, ctx.base_tip], check=False).stdout  # same shape as the main diff: parse_diff reads a/ b/
         side = {f.old_path: f for f in parse_diff(diff)}
     groups = defaultdict(list)
     for item in _drift(ctx, changed, by_old, side):
@@ -903,21 +911,22 @@ def _subst(s, entry, env):
     return re.sub(r"\$\{?([A-Za-z_]\w*)\}?", lambda m: str(env[m[1]]) if m[1] in env else m[0], s)
 
 
-VALUE_OPTS = {"-k", "-m", "-p", "-c", "-o", "--basetemp", "--junitxml", "--rootdir", "--deselect", "--confcutdir", "-n", "--maxfail", "--durations", "--tb", "-W", "--timeout", "--log-level"}
+VALUE_OPTS = {"-k", "-m", "-p", "-c", "-o", "--basetemp", "--junitxml", "--rootdir", "--deselect", "--confcutdir", "-n", "--maxfail", "--durations", "--tb", "-W", "--timeout", "--log-level", "--cov", "--cov-report", "--cov-config"}
 
 
 def pytest_invocations(cmd):
     """(mode, paths, ignores) for each test command in a shell script: pytest (run, partial or collect), and a test
     file run directly or through `-m unittest`, which runs it whole."""
     text = re.sub(r"\\\n\s*", " ", cmd)
-    for seg in re.split(r"\n|;|&&|\|\|", text):
+    for seg in re.split(r"\n|;|&&|\|\|?", text):  # a pipe ends the command too: `pytest -q | tee log`
         direct = re.findall(r"(?:^|\s)python[\d.]*\s+(?:-\S+\s+)*([\w./-]*test_\w+\.py)\b", seg)
         unit = re.search(r"-m\s+unittest\b(.*)", seg)
         if direct or unit:
             yield "run", direct + ([t for t in unit.group(1).split() if not t.startswith("-")] if unit else []), []
             continue
-        if not re.search(r"(^|[\s/])pytest(\s|$)", seg): continue
-        toks = seg.replace("'", " ").replace('"', " ").split()
+        if not re.search(r"(^|[\s/])pytest(\s|$)", seg) or re.search(r"\binstall\b.*\bpytest\b", seg): continue  # `pip install pytest` runs nothing
+        try: toks = shlex.split(seg)  # `-m "not slow"` is one value, not a path named slow
+        except ValueError: toks = seg.replace("'", " ").replace('"', " ").split()
         i = next(k for k, t in enumerate(toks) if t.endswith("pytest"))
         args, paths, ignores, mode, skipnext = toks[i + 1:], [], [], "run", False
         for k, t in enumerate(args):
@@ -926,6 +935,8 @@ def pytest_invocations(cmd):
             elif t == "-k" or t.startswith("-k"): mode = "partial" if mode != "collect" else mode
             if t.startswith("--ignore="): ignores.append(t.split("=", 1)[1]); continue
             if t == "--ignore": ignores.append(args[k + 1] if k + 1 < len(args) else ""); skipnext = True; continue
+            if re.fullmatch(r"\d*[<>]+", t): skipnext = True; continue  # `> log`, `2> err`
+            if re.match(r"\d*[<>]", t): continue  # `2>&1`, `>log`
             if t in VALUE_OPTS: skipnext = True; continue
             if t.startswith("-") or t.startswith("$") or "=" in t: continue
             if "::" in t: mode = "partial" if mode == "run" else mode; t = t.split("::")[0]
@@ -950,7 +961,7 @@ def collect_ignores(ctx, tree_text):
 
 
 def ci_selection(workflows, universe, ignores):
-    sel = {}
+    sel, ignores = {}, [g.rstrip("/") for g in ignores]
     for wtext in workflows:
         wf = parse_yaml(wtext) or {}
         jobs = wf.get("jobs") if isinstance(wf, dict) else None
@@ -961,13 +972,13 @@ def ci_selection(workflows, universe, ignores):
                     if not isinstance(step, dict) or "run" not in step or not _eval_if(step.get("if"), entry): continue
                     env = {k: _subst(str(v), entry, {}) for k, v in {**(job.get("env") or {}), **(step.get("env") or {})}.items()}
                     for mode, paths, extra in pytest_invocations(_subst(str(step["run"]), entry, env)):
-                        drop = ignores + extra
+                        drop = ignores + [g.rstrip("/") for g in extra]
                         targets = paths or [""]
                         for t in targets:
                             t = t.strip("/")
                             if any(ch in t for ch in "*?["): hit = [u for u in universe if fnmatch.fnmatch(u, t)]
                             elif t in universe: hit = [t]
-                            else: hit = [u for u in universe if (not t or u.startswith(t + "/")) and not any(u.startswith(g + "/") and not t.startswith(g) for g in drop)]
+                            else: hit = [u for u in universe if (not t or u.startswith(t + "/")) and not any((u == g or u.startswith(g + "/")) and not t.startswith(g) for g in drop)]
                             for u in hit:
                                 if RANK[mode] > RANK.get(sel.get(u), 0): sel[u] = mode
     return sel
@@ -986,12 +997,14 @@ def test_universe(ctx):
 
 def ci_head(ctx):
     if not hasattr(ctx, "_ci_head"):
-        ctx._ci_head = ci_selection(_workflows(ctx), test_universe(ctx), collect_ignores(ctx, ctx.text)) if _workflows(ctx) else {}
+        wf = _workflows(ctx)
+        ctx._ci_head = ci_selection(wf, test_universe(ctx), collect_ignores(ctx, ctx.text)) if wf else {}
     return ctx._ci_head
 
 
 def tests_ci(ctx):
-    added = [f.path for f in ctx.changed(".py", statuses="A") if f.path in test_universe(ctx)]
+    uni = set(test_universe(ctx))
+    added = [f.path for f in ctx.changed(".py", statuses="A") if f.path in uni]
     if not added or not _workflows(ctx): return
     sel = ci_head(ctx)
     for p in added:
@@ -1003,7 +1016,11 @@ def tests_ci(ctx):
 def tests_ci_diff(ctx):
     if not any(f.path.startswith(".github/workflows/") or base(f.path) == "conftest.py" for f in ctx.files.values()): return
     uni = test_universe(ctx)
-    old = ci_selection(_workflows(ctx, ctx.merge_base), uni, collect_ignores(ctx, lambda p: ctx.base_text(p) or ctx.text(p)))
+    def old_text(p):  # a conftest this diff adds ignored nothing before; an unreadable base falls back to the live text
+        if p in ctx.files and ctx.files[p].status == "A": return ""
+        b = ctx.base_text(p)
+        return ctx.text(p) if b is None else b
+    old = ci_selection(_workflows(ctx, ctx.merge_base), uni, collect_ignores(ctx, old_text))
     new = ci_head(ctx)
     for p in sorted(old):
         if RANK[old[p]] >= 2 and RANK.get(new.get(p), 0) < RANK[old[p]]:
@@ -1404,7 +1421,7 @@ def py_unused(ctx):
 # ---------------------------------------------------------------- E. hygiene, scope, commits
 
 def hygiene_diff_check(ctx):
-    p = run(["git", "-C", str(ctx.root), "diff", "--check", ctx.merge_base], check=False)
+    p = run(["git", "-C", str(ctx.root), "-c", "core.quotePath=false", "diff", "--check", ctx.merge_base], check=False)
     for line in p.stdout.splitlines():
         m = re.match(r"^(.+?):(\d+): (.+)$", line)
         if m and m[1] in ctx.files and not ctx.files[m[1]].excluded: yield m[1], int(m[2]), m[3]
