@@ -15,8 +15,8 @@ set": tracked and untracked files minus `frozen_lists` (sha256 manifests whose f
 The fast tier is static. --full adds test collection, a fix-removal run (changed tests against base code) and mutation
 of changed lines (--budget seconds), each in temporary `git worktree`s that are removed afterwards, under a macOS
 sandbox that denies signals to any process outside the test run's own tree (elsewhere those checks are skipped).
-After a full run on the branch whose mutation finished, the next one mutates only the lines changed
-since it (--mutate-all for all of them).
+Mutation traces which tests run each changed line and runs each mutant against only those. A later full run reuses a
+mutant's verdict while its line is unchanged (--mutate-all reruns them).
 Receipts: every run writes <git-common-dir>/preflight/<HEAD>.<fast|full>.json (head, dirty, partial, the open blocks
 and asks with their ids), so a hook or a reviewer can ask whether this exact commit passed without rerunning it.
 Dispositions: a ledger line `- <id> <reason>` (the run writes a template to OUT/ledger.md; pass it back with --ledger),
@@ -448,7 +448,7 @@ def write_receipt(ctx, a, unique, code, out):
                open=[dict(id=f.id, check=f.check, severity=f.severity, path=f.path, line=f.line, message=f.message)
                      for f in unique if f.severity in ("block", "ask") and not f.disposition],
                counts={s: sum(f.severity == s for f in unique) for s in SEVERITIES},
-               mutation=getattr(ctx, "mutation", None))  # a later full run on this branch mutates only what changed since
+               mutation=getattr(ctx, "mutation", None))  # each mutant's verdict, which a later full run reuses
     path = d / f"{ctx.head}.{tier}.json"
     path.write_text(json.dumps(rec, indent=1))
     return path
@@ -515,7 +515,7 @@ def main():
     r.add_argument("--full", action="store_true", help="also collect tests, rerun changed tests on base code, and mutate changed lines")
     r.add_argument("--budget", type=int, default=600, help="seconds the mutation run may take (default 600)")
     r.add_argument("--mutate-all", action="store_true",
-                   help="mutate every changed line, not only those changed since this branch's last finished full run")
+                   help="rerun every mutant instead of reusing verdicts from an earlier full run of this branch")
     r.add_argument("--owned", nargs="*", default=[], help="globs this change may touch; anything else is a block")
     r.add_argument("--readonly", nargs="*", default=[], help="globs this change must not touch")
     r.add_argument("--ledger", help="ledger file with `- <id> <reason>` dispositions from an earlier run")

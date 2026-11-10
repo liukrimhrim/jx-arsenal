@@ -61,10 +61,17 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
   - **Mutation** splices one node's exact byte range per mutant, so file-hash tests stay meaningful. It first
     runs a no-op control mutant: tests that fail on the control (hash-pinned files) don't count as kills.
     Timeouts count as unknown. `--budget` bounds the run.
-  - **Incremental mutation.** Each full run records its mutation result in the receipt. When the branch already has a
-    finished full run (same merge base, clean tree, no mutant left unrun), the next full run mutates only the lines
-    changed since that commit, so a fix commit costs seconds rather than the whole budget. `--mutate-all` mutates
-    every changed line again.
+  - **Per-line test selection.** The baseline run is traced: a `sitecustomize` hook, loaded through `PYTHONPATH`
+    into pytest and every Python process its tests start, records which test (`PYTEST_CURRENT_TEST`) executes which
+    line of the file being mutated. Each mutant then runs only the tests that execute its line, plus any test seen
+    starting a process with an environment of its own. A line no test was seen running gets every test. A test
+    that reaches a line only through `python -I`, or through a child whose environment drops `PYTHONPATH`, is
+    invisible to the trace, so a kill it would make is missed. Workers default to half the CPUs, 2 to 4 (each is a worktree).
+  - **Reused verdicts.** Each full run records every mutant's verdict in the receipt, keyed by its line's text and
+    the mutation. A later full run whose HEAD descends from that run's head reuses a kill while the killing test
+    still passes, and a survival while the module's test files are unchanged. Everything else runs again, including
+    mutants a budget cut left unrun, so a rerun after a fix spends its budget on what is new. `--mutate-all` reruns
+    every mutant.
   - **Fix-removal** reverts the non-test changes and reports changed tests that still pass. A parametrized test counts as one test: it is reported only when none of its cases fails.
 
 ## Repo config: `.jx/preflight.json`

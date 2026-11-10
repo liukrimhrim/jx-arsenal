@@ -1,12 +1,12 @@
 """Dynamic checks for `jx preflight --full`: test collection, the fix-removal run and mutation of changed lines.
 They run the repo's tests with `test_python` inside temporary `git worktree`s (tests that call git need a real
 checkout), carry over uncommitted and untracked changes, and remove the worktrees afterwards."""
-import ast, copy, functools, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
+import ast, copy, functools, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from preflight import Check, Skipped, parse_diff, run
+from preflight import Check, Skipped, run
 
 
 def _env(ctx):
@@ -53,13 +53,13 @@ def sandbox_problem():
     return f"sandbox-exec exited {p.returncode}: {p.stderr.strip()[:200]} (inside another sandbox? run jx preflight outside it)" if p.returncode else ""
 
 
-def pytest(ctx, tree, files, timeout=None, extra=()):
+def pytest(ctx, tree, files, timeout=None, extra=(), env=None):
     """Run pytest on files inside tree. Returns (status, {case: pass|fail|skip}, seconds); status is ok, failed or timeout."""
     if sandbox_problem(): raise Skipped(f"tests must not run where they can signal processes outside their own tree: {sandbox_problem()}")
     fd, junit = tempfile.mkstemp(suffix=".xml", prefix="jx-preflight-"); os.close(fd)
     argv = ["sandbox-exec", "-p", SANDBOX, ctx.test_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", *extra, *files]
     t0 = time.time()
-    p = subprocess.Popen(argv, cwd=tree, env=_env(ctx), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    p = subprocess.Popen(argv, cwd=tree, env=env or _env(ctx), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
         out, _ = p.communicate(timeout=timeout)
         status = "ok" if p.returncode == 0 else "failed"
@@ -229,53 +229,111 @@ def _tests_for(ctx, path):
     return list(dict.fromkeys(hits + [c for c in changed if re.search(rf"\b{re.escape(stem)}\b", ctx.text(c) or "")]))[:25]
 
 
-def previous_mutation(ctx):
-    """(head, {path: lines added since head} or None for a file head lacks) of the latest earlier full jx run on this
-    branch, same merge base, clean tree, whose mutation finished; None when there is none or --mutate-all is set."""
-    if getattr(ctx.args, "mutate_all", False): return None
+# Loaded through PYTHONPATH into the baseline's pytest process and every Python process its tests start: records which
+# test (PYTEST_CURRENT_TEST, inherited by child processes) executes which line of the file being mutated, and which
+# tests start a process with an environment of their own, which the trace cannot follow.
+TRACER = r"""
+import os, sys, threading
+_here = os.path.dirname(os.path.abspath(__file__))
+for _d in sys.path:  # run the sitecustomize this one shadows (Homebrew's Python ships one)
+    _f = os.path.join(_d or ".", "sitecustomize.py")
+    if os.path.abspath(_d or ".") != _here and os.path.isfile(_f):
+        with open(_f) as _fh:
+            exec(compile(_fh.read(), _f, "exec"), {"__name__": "sitecustomize", "__file__": _f})
+        break
+_target, _out = os.environ.get("JX_TRACE_FILE"), os.environ.get("JX_TRACE_OUT")
+if _target and _out:
+    _seen, _files = set(), {}
+
+    def _write(kind, value):
+        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+        if (kind, test, value) not in _seen:
+            _seen.add((kind, test, value))
+            with open(os.path.join(_out, f"{os.getpid()}.tsv"), "a") as fh:  # written as it goes: a killed child keeps its lines
+                fh.write(f"{kind}\t{test}\t{value}\n")
+
+    def _local(frame, event, arg):
+        if event == "line":
+            _write("line", frame.f_lineno)
+        return _local
+
+    def _call(frame, event, arg):
+        name = frame.f_code.co_filename
+        if name not in _files:
+            _files[name] = os.path.realpath(name) == _target
+        return _local if _files[name] else None
+
+    sys.settrace(_call)
+    threading.settrace(_call)
+    import subprocess
+    _init = subprocess.Popen.__init__
+
+    def _popen(self, *a, **k):
+        if k.get("env") is not None and "JX_TRACE_OUT" not in k["env"]:
+            _write("opaque", "")
+        _init(self, *a, **k)
+    subprocess.Popen.__init__ = _popen
+"""
+
+
+def traced(ctx, tree, files, path, timeout):
+    """The baseline run, traced: (status, cases, seconds, output, {line: {test node ids}}, {node ids the trace cannot follow})."""
+    out, site = Path(tempfile.mkdtemp(prefix="jx-trace-")), Path(tempfile.mkdtemp(prefix="jx-tracer-"))
+    try:
+        (site / "sitecustomize.py").write_text(TRACER)
+        env = _env(ctx)
+        env.update(JX_TRACE_FILE=os.path.realpath(tree / path), JX_TRACE_OUT=str(out),
+                   PYTHONPATH=os.pathsep.join(filter(None, [str(site), env.get("PYTHONPATH")])))
+        status, cases, secs, text = pytest(ctx, tree, files, timeout=timeout, env=env)
+        lines, opaque = {}, set()
+        for f in out.glob("*.tsv"):
+            for row in f.read_text(errors="replace").splitlines():
+                kind, test, value = (row.split("\t") + ["", ""])[:3]
+                if not test or not (tree / test.split("::")[0]).is_file(): continue  # import time, or not a runnable node id
+                if kind == "opaque": opaque.add(test)
+                elif kind == "line" and value.isdigit(): lines.setdefault(int(value), set()).add(test)
+        return status, cases, secs, text, lines, opaque
+    finally:
+        shutil.rmtree(out, ignore_errors=True); shutil.rmtree(site, ignore_errors=True)
+
+
+def earlier_verdicts(ctx):
+    """(head, {mutant key: result}) from the latest earlier jx full run whose head is HEAD or an ancestor of it."""
+    if getattr(ctx.args, "mutate_all", False): return None, {}
     common = Path(run(["git", "-C", str(ctx.root), "rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.strip())
     best = None
     for p in (common / "preflight").glob("*.full.json"):
         try: rec = json.loads(p.read_text())
         except (OSError, ValueError, RecursionError): continue
         m = rec.get("mutation") if isinstance(rec, dict) else None
-        if not (isinstance(m, dict) and m.get("skipped") == 0 and rec.get("runner") == "jx" and not rec.get("dirty")
-                and rec.get("merge_base") == ctx.merge_base and rec.get("head") not in (None, ctx.head)): continue
+        if not (isinstance(m, dict) and isinstance(m.get("results"), list) and rec.get("runner") == "jx" and isinstance(rec.get("head"), str)): continue
         if run(["git", "-C", str(ctx.root), "merge-base", "--is-ancestor", rec["head"], "HEAD"], check=False).returncode: continue
         if best is None or str(rec.get("created", "")) > str(best.get("created", "")): best = rec
-    if best is None: return None
-    diff = run(["git", "-C", str(ctx.root), "-c", "core.quotePath=false", "diff", "-U0", "--find-renames", "--no-color",
-                "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", best["head"]]).stdout  # the working tree, as the run sees it
-    since = {c.path: c.added for c in parse_diff(diff)}
-    known = set(run(["git", "-C", str(ctx.root), "ls-tree", "-r", "--name-only", best["head"]]).stdout.split())
-    return best["head"], {p: (since.get(p, set()) if p in known else None) for f in ctx.files.values() for p in [f.path]}
+    if best is None: return None, {}
+    return best["head"], {tuple(r["key"]): r for r in best["mutation"]["results"] if isinstance(r, dict) and isinstance(r.get("key"), list)}
 
 
 def tests_mutate(ctx):
     vocab = list(ctx.config.get("status_vocab") or [])
     deadline = time.time() + ctx.args.budget
-    prev = previous_mutation(ctx)
-    # with an earlier finished run on this branch, mutate only what changed since; a file it lacked counts as all new
-    lines = {f.path: f.added if not prev or prev[1].get(f.path) is None else f.added & prev[1][f.path] for f in ctx.changed(".py", tests=False)}
-    targets = [f for f in ctx.changed(".py", tests=False) if lines[f.path] and ctx.tree(f.path) is not None]
-    scope = f" on the lines changed since the full run of {prev[0][:12]} (--mutate-all for every changed line)" if prev else ""
+    since, earlier = earlier_verdicts(ctx)
+    targets = [f for f in ctx.changed(".py", tests=False) if f.added and ctx.tree(f.path) is not None]
+    total, results = dict(killed=0, survived=0, unknown=0, skipped=0, reused=0), []
     if not targets:
-        ctx.mutation = dict(killed=0, survived=0, unknown=0, skipped=0, since=prev[0] if prev else None)
-        if prev: yield "", "", f"mutation: nothing to mutate{scope}", "info"
-        return
-    workers = max(1, int(ctx.config.get("workers") or 2))
+        ctx.mutation = dict(total, results=results); return
+    workers = max(1, int(ctx.config.get("workers") or min(4, max(2, (os.cpu_count() or 4) // 2))))
     trees = [worktree(ctx) for _ in range(workers)]
-    free = list(trees); lock = threading.Lock(); total = dict(killed=0, survived=0, unknown=0, skipped=0)
+    free = list(trees); lock = threading.Lock()
     try:
         for f in targets:
             tests = _tests_for(ctx, f.path)
             src = (ctx.root / f.path).read_bytes()
-            muts = list(mutants(src, ctx.tree(f.path), lines[f.path], vocab))
+            muts = list(mutants(src, ctx.tree(f.path), f.added, vocab))
             if not muts: continue
             if not tests:
-                yield f.path, min(lines[f.path]), f"no test imports {f.path}; its {len(muts)} mutants of changed lines cannot be killed"; continue
+                yield f.path, min(f.added), f"no test imports {f.path}; its {len(muts)} mutants of changed lines cannot be killed"; continue
             if time.time() > deadline: total["skipped"] += len(muts); continue
-            status, base, secs, out = pytest(ctx, trees[0], tests, timeout=max(60, deadline - time.time()))
+            status, base, secs, out, covering, opaque = traced(ctx, trees[0], tests, f.path, timeout=max(60, deadline - time.time()))
             passing = {k for k, v in base.items() if v == "pass"}
             if not passing:
                 yield f.path, "", f"baseline tests for {f.path} pass nothing ({status}); mutation skipped: {out.strip()[-200:]}"; continue
@@ -284,39 +342,62 @@ def tests_mutate(ctx):
             (trees[0] / f.path).write_bytes(src)
             pinned = {k for k in passing if ctrl.get(k) != "pass"}
             per = 3 * secs + 5
+            texts = src.decode("utf-8", "replace").splitlines()
+            tests_sha = hashlib.sha256(b"".join((ctx.root / t).read_bytes() for t in tests if (ctx.root / t).is_file())).hexdigest()
             order, by_line = [], {}
             for m in muts: by_line.setdefault(src[:m[0]].count(b"\n") + 1, []).append(m)
             while any(by_line.values()):
                 for ln in sorted(by_line):
                     if by_line[ln]: order.append((ln, by_line[ln].pop(0)))
 
+            def key(ln, desc):  # what the verdict depends on: the line's text (nth of its copies) and the mutation
+                text = texts[ln - 1] if ln <= len(texts) else ""
+                return [f.path, text, texts[:ln - 1].count(text), desc]
+
             def one(item):
                 ln, (a, b, rep, desc) = item
-                if time.time() > deadline: return ln, desc, "skipped"
+                old = earlier.get(tuple(key(ln, desc)))
+                if old and ((old.get("verdict") == "killed" and old.get("killer") in passing - pinned)
+                            or (old.get("verdict") == "survived" and old.get("tests_sha") == tests_sha)):
+                    return ln, desc, old["verdict"], old.get("killer"), old.get("ran"), True
+                if time.time() > deadline: return ln, desc, "skipped", None, None, False
                 new = src[:a] + rep.encode() + src[b:]
                 try: ast.parse(new)
-                except SyntaxError: return ln, desc, "invalid"
+                except SyntaxError: return ln, desc, "invalid", None, None, False
+                # ponytail: a test that reaches this line only in a process started with `python -I`, or one whose
+                # environment drops PYTHONPATH without passing env= to Popen, is invisible to the trace, so its kill is
+                # missed. Tests seen starting a process with their own env always run; lines no test was seen running
+                # get every test, as before.
+                picked = sorted(covering.get(ln, set()) | opaque)
+                run_on = picked if covering.get(ln) else tests
                 with lock: t = free.pop()
                 try:
                     (t / f.path).write_bytes(new)
-                    st, res, _, _ = pytest(ctx, t, tests, timeout=per, extra=("-x",) if not pinned else ())
+                    st, res, _, _ = pytest(ctx, t, run_on, timeout=per, extra=("-x",) if not pinned else ())
                 finally:
                     (t / f.path).write_bytes(src)
                     with lock: free.append(t)
-                if st == "timeout": return ln, desc, "unknown"
-                if any(res.get(k) == "fail" for k in passing - pinned): return ln, desc, "killed"
-                if any(res.get(k) == "fail" for k in pinned): return ln, desc, "unknown"
-                if st == "failed" and not res: return ln, desc, "killed"
-                return ln, desc, "survived"
+                killer = next((k for k in sorted(res) if res[k] == "fail" and k in passing - pinned), None)
+                ran = len(picked) if covering.get(ln) else None
+                if st == "timeout": return ln, desc, "unknown", None, ran, False
+                if killer: return ln, desc, "killed", killer, ran, False
+                if any(res.get(k) == "fail" for k in pinned): return ln, desc, "unknown", None, ran, False
+                if st == "failed" and not res: return ln, desc, "killed", None, ran, False
+                return ln, desc, "survived", None, ran, False
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for ln, desc, verdict in pool.map(one, order):
+                for ln, desc, verdict, killer, ran, reused in pool.map(one, order):
                     if verdict == "invalid": continue
-                    total[verdict] = total.get(verdict, 0) + 1
+                    total[verdict] += 1; total["reused"] += reused
+                    if verdict in ("killed", "survived"):
+                        results.append(dict(key=key(ln, desc), verdict=verdict, killer=killer, ran=ran, tests_sha=tests_sha))
                     if verdict == "survived":
-                        yield f.path, ln, f"mutant survived {len(tests)} test files: {desc}; no test notices this change in behaviour"
-        ctx.mutation = dict(total, since=prev[0] if prev else None)
-        yield "", "", f"mutation{scope}: {total['killed']} killed, {total['survived']} survived, {total['unknown']} unknown (timeout or hash-pinned), {total['skipped']} not run (budget {ctx.args.budget}s)", "info"
+                        who = f"the {ran} test(s) that run line {ln}" if ran else f"{len(tests)} test files"
+                        yield f.path, ln, f"mutant survived {who}: {desc}; no test notices this change in behaviour"
+        ctx.mutation = dict(total, results=results)
+        reuse = f"; {total['reused']} verdicts reused from the full run of {since[:12]} (--mutate-all reruns them)" if total["reused"] else ""
+        yield "", "", (f"mutation: {total['killed']} killed, {total['survived']} survived, {total['unknown']} unknown (timeout or "
+                       f"hash-pinned), {total['skipped']} not run (budget {ctx.args.budget}s){reuse}"), "info"
     finally:
         for t in trees: drop(ctx, t)
 
