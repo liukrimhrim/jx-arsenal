@@ -322,8 +322,7 @@ def tests_mutate(ctx):
     if not targets:
         ctx.mutation = dict(total, results=results); return
     workers = max(1, int(ctx.config.get("workers") or min(4, max(2, (os.cpu_count() or 4) // 2))))
-    trees = [worktree(ctx) for _ in range(workers)]
-    free = list(trees); lock = threading.Lock()
+    trees, free, lock = [], [], threading.Lock()  # worktrees are made on first need: a rerun that reuses every verdict makes none
     try:
         for f in targets:
             tests = _tests_for(ctx, f.path)
@@ -332,16 +331,6 @@ def tests_mutate(ctx):
             if not muts: continue
             if not tests:
                 yield f.path, min(f.added), f"no test imports {f.path}; its {len(muts)} mutants of changed lines cannot be killed"; continue
-            if time.time() > deadline: total["skipped"] += len(muts); continue
-            status, base, secs, out, covering, opaque = traced(ctx, trees[0], tests, f.path, timeout=max(60, deadline - time.time()))
-            passing = {k for k, v in base.items() if v == "pass"}
-            if not passing:
-                yield f.path, "", f"baseline tests for {f.path} pass nothing ({status}); mutation skipped: {out.strip()[-200:]}"; continue
-            (trees[0] / f.path).write_bytes(src + b"\n# jx-preflight control mutant\n")
-            _, ctrl, _, _ = pytest(ctx, trees[0], tests, timeout=3 * secs + 30)
-            (trees[0] / f.path).write_bytes(src)
-            pinned = {k for k in passing if ctrl.get(k) != "pass"}
-            per = 3 * secs + 5
             texts = src.decode("utf-8", "replace").splitlines()
             tests_sha = hashlib.sha256(b"".join((ctx.root / t).read_bytes() for t in tests if (ctx.root / t).is_file())).hexdigest()
             order, by_line = [], {}
@@ -354,11 +343,29 @@ def tests_mutate(ctx):
                 text = texts[ln - 1] if ln <= len(texts) else ""
                 return [f.path, text, texts[:ln - 1].count(text), desc]
 
+            def held(ln, desc):  # an earlier verdict made with these same test files
+                old = earlier.get(tuple(key(ln, desc)))
+                return old if old and old.get("tests_sha") == tests_sha and old.get("verdict") in ("killed", "survived", "unknown") else None
+
+            passing = pinned = set(); covering, opaque, per = {}, set(), 0
+            if not all(held(ln, m[3]) for ln, m in order):  # something must run: baseline, control mutant, worktrees
+                if time.time() > deadline: total["skipped"] += len(muts); continue
+                if not trees:
+                    trees.extend(worktree(ctx) for _ in range(workers)); free.extend(trees)
+                status, base, secs, out, covering, opaque = traced(ctx, trees[0], tests, f.path, timeout=max(60, deadline - time.time()))
+                passing = {k for k, v in base.items() if v == "pass"}
+                if not passing:
+                    yield f.path, "", f"baseline tests for {f.path} pass nothing ({status}); mutation skipped: {out.strip()[-200:]}"; continue
+                (trees[0] / f.path).write_bytes(src + b"\n# jx-preflight control mutant\n")
+                _, ctrl, _, _ = pytest(ctx, trees[0], tests, timeout=3 * secs + 30)
+                (trees[0] / f.path).write_bytes(src)
+                pinned = {k for k in passing if ctrl.get(k) != "pass"}
+                per = 3 * secs + 5
+
             def one(item):
                 ln, (a, b, rep, desc) = item
-                old = earlier.get(tuple(key(ln, desc)))
-                if old and ((old.get("verdict") == "killed" and old.get("killer") in passing - pinned)
-                            or (old.get("verdict") == "survived" and old.get("tests_sha") == tests_sha)):
+                old = held(ln, desc) or earlier.get(tuple(key(ln, desc)))
+                if old and (held(ln, desc) or (old.get("verdict") == "killed" and old.get("killer") in passing - pinned)):
                     return ln, desc, old["verdict"], old.get("killer"), old.get("ran"), True
                 if time.time() > deadline: return ln, desc, "skipped", None, None, False
                 new = src[:a] + rep.encode() + src[b:]
@@ -389,7 +396,7 @@ def tests_mutate(ctx):
                 for ln, desc, verdict, killer, ran, reused in pool.map(one, order):
                     if verdict == "invalid": continue
                     total[verdict] += 1; total["reused"] += reused
-                    if verdict in ("killed", "survived"):
+                    if verdict in ("killed", "survived", "unknown"):
                         results.append(dict(key=key(ln, desc), verdict=verdict, killer=killer, ran=ran, tests_sha=tests_sha))
                     if verdict == "survived":
                         who = f"the {ran} test(s) that run line {ln}" if ran else f"{len(tests)} test files"

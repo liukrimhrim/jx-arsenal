@@ -461,16 +461,18 @@ class DynamicTests(Base):
         self.assertNotIn(f"{verdicts} verdicts reused", info)
 
     def test_a_run_its_budget_cut_short_resumes(self):
-        r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": "from calc import ok\ndef test_ok():\n    assert ok(1) == 1\n",
-                       ".jx/preflight.json": self.config()})
+        slow = "import time\ntime.sleep(2)\nfrom calc import ok\ndef test_ok():\n    assert ok(1) == 1\n"  # every pytest run costs 2 s
+        r = self.repo({"calc.py": "def ok(x):\n    return x\n", "tests/test_calc.py": slow, ".jx/preflight.json": self.config()})
         r.commit({"calc.py": "def ok(x):\n    return x if x < 10 else 0\n"})
         _, info = self.mutate(r, "--budget", "0")
         self.assertRegex(info, r"^mutation: 0 killed, 0 survived, .* [1-9]\d* not run")
         _, info = self.mutate(r)  # the same commit: nothing to reuse, so everything runs
         ran = sum(int(n) for n in re.findall(r"(\d+) (?:killed|survived)", info))
         self.assertTrue(ran and "reused" not in info, info)
+        t0 = time.time()
         _, info = self.mutate(r)
         self.assertIn(f"{ran} verdicts reused", info)
+        self.assertLess(time.time() - t0, 3)  # every verdict held, so no baseline, control mutant or worktree
 
     def test_each_mutant_runs_only_the_tests_that_execute_its_line(self):
         r = self.repo({"calc.py": "def ok(x):\n    return x\n\n\ndef other(x):\n    return x\n",

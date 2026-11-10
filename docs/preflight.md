@@ -67,10 +67,11 @@ rule: `- <check-glob> <path-glob>: <reason>`. A disposed finding never fails the
     starting a process with an environment of its own. A line no test was seen running gets every test. A test
     that reaches a line only through `python -I`, or through a child whose environment drops `PYTHONPATH`, is
     invisible to the trace, so a kill it would make is missed. Workers default to half the CPUs, 2 to 4 (each is a worktree).
-  - **Reused verdicts.** Each full run records every mutant's verdict in the receipt, keyed by its line's text and
-    the mutation. A later full run whose HEAD descends from that run's head reuses a kill while the killing test
-    still passes, and a survival while the module's test files are unchanged. Everything else runs again, including
-    mutants a budget cut left unrun, so a rerun after a fix spends its budget on what is new. `--mutate-all` reruns
+  - **Reused verdicts.** Each full run records every mutant's verdict in the receipt (killed, survived, or unknown
+    for a timeout), keyed by its line's text and the mutation. A later full run whose HEAD descends from that run's
+    head reuses any verdict made with the same test files. When the test files changed, it reuses a kill while the
+    killing test still passes. Everything else runs again, including mutants a budget cut left unrun. When every
+    mutant of a file holds, nothing runs for it: no baseline, no control mutant, no worktree. `--mutate-all` reruns
     every mutant.
   - **Fix-removal** reverts the non-test changes and reports changed tests that still pass. A parametrized test counts as one test: it is reported only when none of its cases fails.
 
