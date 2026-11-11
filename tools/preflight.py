@@ -75,6 +75,16 @@ def git(root, *args, ok=(0,)):
     return run(["git", "-C", str(root), *args], ok=ok).stdout
 
 
+def fresh_out(root, keep=10):
+    """A new report directory under <git-dir>/preflight-out: one per run (receipts and the ledger name it), per worktree,
+    never tracked, gone with the clone. Only the newest `keep` stay, so runs do not pile up in the temp root."""
+    base = Path(git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()) / "preflight-out"
+    base.mkdir(parents=True, exist_ok=True)
+    for old in sorted(base.iterdir())[:-(keep - 1)]:  # names start with the time, so name order is age order
+        shutil.rmtree(old, ignore_errors=True)
+    return Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=base))
+
+
 def glob_re(pattern):
     """Compile a git-style glob: `**` spans directories, `*` and `?` stay inside one; a slash-free pattern matches a basename."""
     out, i = "", 0
@@ -451,7 +461,7 @@ def cmd_run(a):
             print("check\ttier\tkind\treason")
             for r in rows: print(f"{r['check']}\t{r['tier']}\t{r['kind']}\t{r['reason']}")
         return 0
-    out = Path(a.out) if a.out else Path(tempfile.mkdtemp(prefix="jx-preflight-"))
+    out = Path(a.out) if a.out else fresh_out(root)
     out.mkdir(parents=True, exist_ok=True)
     if ctx.body is not None: (out / "body.md").write_text(ctx.body)
     (out / "change.json").write_text(json.dumps(ctx.as_json(out), indent=1))
@@ -672,7 +682,7 @@ def main():
     r.add_argument("--only", action="append", help="comma list of check ids or globs to run")
     r.add_argument("--skip", action="append", help="comma list of check ids or globs to skip")
     r.add_argument("--strict", action="store_true", help="an ask without a disposition also fails the run")
-    r.add_argument("--out", help="report directory (default a new temp dir)")
+    r.add_argument("--out", help="report directory (default a new one under <git-dir>/preflight-out, which keeps the newest 10)")
     r.add_argument("--config", help="config file to use instead of the repo's .jx/preflight.json (e.g. today's config on an old commit)")
     r.add_argument("--dry-run", action="store_true", help="list the checks that would run, run none")
     sub.add_parser("ls", parents=[common], help="the check catalogue")

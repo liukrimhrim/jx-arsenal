@@ -652,5 +652,17 @@ class DynamicTests(Base):
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
 
+class OutDir(Base):
+    def test_runs_keep_their_reports_in_the_git_dir_and_only_the_newest_ten(self):
+        r = self.repo({"a.py": "x = 1\n"}); r.commit({"a.py": "x = 2\n"})
+        before = set(Path(tempfile.gettempdir()).glob("jx-preflight-*"))
+        for _ in range(12): r.run()
+        kept = sorted((r.path / ".git/preflight-out").iterdir())
+        self.assertEqual(len(kept), 10)
+        self.assertTrue((kept[-1] / "findings.tsv").is_file())
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob("jx-preflight-*")) - before, set())  # nothing left in the temp root
+        self.assertEqual(r.git("status", "--porcelain"), "")  # and nothing the repo would track
+
+
 if __name__ == "__main__":
     unittest.main()
