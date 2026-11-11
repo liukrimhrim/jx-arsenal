@@ -652,5 +652,33 @@ class DynamicTests(Base):
         self.assertEqual((code, rows[0]["severity"]), (1, "block"))
 
 
+class OutDir(Base):
+    PACK = {"a.py": "x = 1\n", ".jx/pack.py": 'print("pack.demo\\tblock\\ta.py\\t1\\tdemo finding\\tPR 1")\n',
+            ".jx/preflight.json": json.dumps({"checks": [{"id": "pack.demo", "cmd": "python3 .jx/pack.py", "when": ["*.py"]}]})}
+
+    def report(self, r, *args):
+        code, rows, err = r.run("--only", "pack.demo", *args)
+        return code, rows, Path(re.search(r"report in (\S+)", err).group(1))
+
+    def test_runs_keep_their_reports_in_the_git_dir_and_only_the_newest_ten(self):
+        r = self.repo(self.PACK); r.commit({"a.py": "x = 2\n"})
+        before = set(Path(tempfile.gettempdir()).glob("jx-preflight-*"))
+        made = [self.report(r)[2] for _ in range(12)]  # several a second: the order must not rest on the second
+        self.assertEqual(sorted(p.name for p in (r.path / ".git/preflight-out").iterdir()), [p.name for p in made[2:]])
+        self.assertTrue((made[-1] / "findings.tsv").is_file())
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob("jx-preflight-*")) - before, set())  # nothing left in the temp root
+        self.assertEqual(r.git("status", "--porcelain"), "")  # and nothing the repo would track
+
+    def test_the_ledger_a_run_is_given_outlives_the_pruning(self):
+        r = self.repo(self.PACK); r.commit({"a.py": "x = 2\n"})
+        code, rows, first = self.report(r)
+        self.assertEqual(code, 1)
+        (first / "ledger.md").write_text(f"- {rows[0]['id']} decision: accepted in review\n")
+        for _ in range(12):  # the ledger's report is long the oldest: every run still reads it
+            code, rows, _ = self.report(r, "--ledger", first / "ledger.md")
+            self.assertEqual((code, rows[0]["disposition"]), (0, "decision: accepted in review"))
+        self.assertEqual(len(list((r.path / ".git/preflight-out").iterdir())), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,8 @@ jx preflight ls | jx preflight doctor
 **Exit codes:** 1 while a block is undisposed, or with `--strict` while an ask is undisposed. 2 on usage
 errors. Otherwise 0.
 
+**Reports.** `OUT` is `--out`, or a new directory under `<git-dir>/preflight-out/` (per worktree, never tracked); only the newest 10 stay, and the report holding the `--ledger` a run is given is never the one removed.
+
 **Dispositions.** Every run writes `OUT/ledger.md` with one `- <id> TODO` line per open block or ask. Replace
 `TODO` with a reason (`done: path:line`, `n/a: why`, `decision: who/where`) and rerun with `--ledger`. Decisions
 that hold across PRs go in the repo's dispositions file (default `.jx/preflight/DISPOSITIONS.md`), one line per
