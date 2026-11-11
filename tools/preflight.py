@@ -75,14 +75,18 @@ def git(root, *args, ok=(0,)):
     return run(["git", "-C", str(root), *args], ok=ok).stdout
 
 
-def fresh_out(root, keep=10):
+def fresh_out(root, keep=10, protect=None):
     """A new report directory under <git-dir>/preflight-out: one per run (receipts and the ledger name it), per worktree,
-    never tracked, gone with the clone. Only the newest `keep` stay, so runs do not pile up in the temp root."""
+    never tracked, gone with the clone. Only the newest `keep` stay, so runs do not pile up in the temp root; `protect`,
+    the directory of the ledger this run was given, is never the one removed."""
     base = Path(git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()) / "preflight-out"
     base.mkdir(parents=True, exist_ok=True)
-    for old in sorted(base.iterdir())[:-(keep - 1)]:  # names start with the time, so name order is age order
+    dirs = sorted(base.iterdir())  # names are UTC times to the nanosecond, so name order is creation order
+    spare = [d for d in dirs if protect is None or d.resolve() != Path(protect).resolve()]
+    for old in spare[:max(0, len(dirs) - (keep - 1))]:
         shutil.rmtree(old, ignore_errors=True)
-    return Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=base))
+    t = time.time_ns()
+    return Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S", time.gmtime(t // 10**9)) + f".{t % 10**9:09d}Z-", dir=base))
 
 
 def glob_re(pattern):
@@ -461,7 +465,7 @@ def cmd_run(a):
             print("check\ttier\tkind\treason")
             for r in rows: print(f"{r['check']}\t{r['tier']}\t{r['kind']}\t{r['reason']}")
         return 0
-    out = Path(a.out) if a.out else fresh_out(root)
+    out = Path(a.out) if a.out else fresh_out(root, protect=Path(a.ledger).parent if a.ledger else None)
     out.mkdir(parents=True, exist_ok=True)
     if ctx.body is not None: (out / "body.md").write_text(ctx.body)
     (out / "change.json").write_text(json.dumps(ctx.as_json(out), indent=1))
