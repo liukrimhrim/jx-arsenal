@@ -181,6 +181,12 @@ class CitationTests(Base):
         r.commit({"short.md": "1\n2\n3\n4\n5\n6\n"})
         self.assertEqual(r.run("--only", "cite.drift")[1], [])
 
+    def test_a_file_too_big_to_load_still_drifts(self):
+        log = "x" * 99 + "\n"
+        r = self.repo({"big.log": log * 42_000, "GUIDE.md": "See big.log:3.\n"})  # 4.2 MB: past the 4 MB text limit
+        r.commit({"big.log": "header\n" + log * 42_000})
+        self.assertIn("3→4", r.run("--only", "cite.drift")[1][0]["message"])
+
     def test_a_link_target_settles_which_namesake(self):
         log = "".join(f"line {i}\n" for i in range(1, 21))
         r = self.repo({"a/log.txt": log, "b/log.txt": log, "c/log.txt": log})

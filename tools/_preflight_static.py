@@ -670,7 +670,8 @@ def _drift(ctx, changed, by_old, side):
                 if f.status == "D": yield p, target, "deleted", i, a, None; continue
                 m = f.map_line(a)
                 if m is None: yield p, target, "rewritten", i, a, None
-                elif m != a and m <= len(ctx.lines(f.path)): yield p, target, "moved", i, a, m  # past the new end = past the old end: never a line
+                elif m != a and (ctx.text(f.path) is None or m <= len(ctx.lines(f.path))):  # past the new end = past the old end: never a line
+                    yield p, target, "moved", i, a, m  # ponytail: no length (over 4 MB, binary) keeps the warn; count lines if those false-warn
             elif state == "ok" and new_line and side and target in side:
                 m = side[target].map_line(a)
                 if m is None or m != a: yield p, target, "merge", i, a, m
