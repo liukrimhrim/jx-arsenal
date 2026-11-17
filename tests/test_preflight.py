@@ -167,6 +167,33 @@ class CitationTests(Base):
         content = self.hits(rows, "cite.content")
         self.assertEqual([x["line"] for x in content], [3])
 
+    def test_a_link_cites_its_target_not_its_texts_namesake(self):
+        long = "".join(f"line {i}\n" for i in range(1, 301))
+        r = self.repo({"val/PREREG.md": long, "port/PREREG.md": long, "port/EVIDENCE.md":
+                       "Other file: [PREREG.md:241](../val/PREREG.md#L241).\nThis one: [PREREG.md:3](PREREG.md#L3).\n"})
+        r.commit({"port/PREREG.md": "new first line\n" + long})
+        rows = r.run("--only", "cite.drift")[1]
+        self.assertEqual([(x["line"], x["message"].split(" that")[0]) for x in rows], [(2, "cites 1 line(s) of port/PREREG.md")])
+        self.assertIn("3→4", rows[0]["message"])
+
+    def test_a_line_past_the_end_did_not_move(self):
+        r = self.repo({"short.md": "1\n2\n3\n4\n5\n", "GUIDE.md": "See short.md:30 and short.md:5.\n"})
+        r.commit({"short.md": "1\n2\n3\n4\n5\n6\n"})
+        self.assertEqual(r.run("--only", "cite.drift")[1], [])
+
+    def test_a_file_too_big_to_load_still_drifts(self):
+        log = "x" * 99 + "\n"
+        r = self.repo({"big.log": log * 42_000, "GUIDE.md": "See big.log:3.\n"})  # 4.2 MB: past the 4 MB text limit
+        r.commit({"big.log": "header\n" + log * 42_000})
+        self.assertIn("3→4", r.run("--only", "cite.drift")[1][0]["message"])
+
+    def test_a_link_target_settles_which_namesake(self):
+        log = "".join(f"line {i}\n" for i in range(1, 21))
+        r = self.repo({"a/log.txt": log, "b/log.txt": log, "c/log.txt": log})
+        r.commit({"DOC.md": "Linked: [log.txt:13](b/log.txt#L13).\nBare: log.txt:13.\nPast the end: [log.txt:13](b/log.txt#L99).\n"})
+        rows = r.run("--only", "cite.resolve")[1]
+        self.assertEqual(sorted((x["line"], x["severity"]) for x in rows), [(2, "warn"), (3, "block")])
+
 
 class ClaimTests(Base):
     def receipt(self, r, d, **tests):

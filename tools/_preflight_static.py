@@ -554,12 +554,14 @@ LINK = re.compile(r"\[([^\]]*)\]\(([^)\s#]+)#L(\d+)(?:-L?(\d+))?\)")
 
 
 def citations(text):
-    """(line_no, ref, a, b, link_text, start_col) for path:line and [..](path#Ln) citations."""
+    """(line_no, ref, a, b, link_text, start_col) for path:line and [..](path#Ln) citations. A link's target names the
+    file, so a `name:line` in its text is not read again as a bare citation, which would be matched by basename."""
     for i, line in enumerate(text.splitlines(), 1):
+        links = []
         for m in LINK.finditer(line):
-            if "://" not in m[2]: yield i, m[2], int(m[3]), int(m[4] or m[3]), m[1], m.start()
+            if "://" not in m[2]: links.append(m.span()); yield i, m[2], int(m[3]), int(m[4] or m[3]), m[1], m.start()
         for m in CITE.finditer(line):
-            if "://" in line[max(0, m.start() - 12):m.start()]: continue
+            if "://" in line[max(0, m.start() - 12):m.start()] or any(s <= m.start() < e for s, e in links): continue
             yield i, m[1], int(m[2]), int(m[3] or m[2]), None, m.start()
 
 
@@ -668,7 +670,8 @@ def _drift(ctx, changed, by_old, side):
                 if f.status == "D": yield p, target, "deleted", i, a, None; continue
                 m = f.map_line(a)
                 if m is None: yield p, target, "rewritten", i, a, None
-                elif m != a: yield p, target, "moved", i, a, m
+                elif m != a and (ctx.text(f.path) is None or m <= len(ctx.lines(f.path))):  # past the new end = past the old end: never a line
+                    yield p, target, "moved", i, a, m  # ponytail: no length (over 4 MB, binary) keeps the warn; count lines if those false-warn
             elif state == "ok" and new_line and side and target in side:
                 m = side[target].map_line(a)
                 if m is None or m != a: yield p, target, "merge", i, a, m
